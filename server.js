@@ -225,4 +225,185 @@ app.get('/groups', checkAuth, async (req, res) => {
 
 // Main route: called automatically by the quotation tool on every save.
 app.post('/send-quotation', checkAuth, async (req, res) => {
-  if (!clientReady) return res.status(503).json({ error: 'whatsapp
+  if (!clientReady) return res.status(503).json({ error: 'whatsapp client not ready yet' });
+  if (!GROUP_ID) return res.status(500).json({ error: 'GROUP_ID not set on the server - see README.md' });
+  if (isRateLimited()) return res.status(429).json({ error: 'rate limit exceeded' });
+
+  try {
+    const { ref, client: clientName, location, mobile, items, grandTotal } = req.body || {};
+    if (!Array.isArray(items) || !items.length) {
+      return res.status(400).json({ error: 'no items provided' });
+    }
+
+    // NOTE: the outgoing WhatsApp message text below is in Arabic on purpose,
+    // since that's the language of the "Tasks" group / the team reading it.
+    // Only this file's comments and API responses were translated to English.
+    let msg = '📋 *عرض سعر جديد - Merzona*\n';
+    if (ref) msg += `المرجع: ${ref}\n`;
+    if (clientName) msg += `العميل: ${clientName}\n`;
+    if (location) msg += `الإمارة: ${location}\n`;
+    if (mobile) msg += `الموبايل: ${mobile}\n`;
+    msg += '\n*البنود:*\n';
+    items.forEach((it, i) => {
+      const name = (it.name || '').toString().trim();
+      if (!name) return;
+      const dims = it.width && it.height ? `${it.width}×${it.height}mm` : '';
+      const qtyTxt = it.qty ? `×${it.qty}` : '';
+      const priceTxt = it.pricePerM2 ? `${it.pricePerM2} AED/m²` : '';
+      const parts = [name, dims, qtyTxt, priceTxt].filter(Boolean);
+      msg += `${i + 1}. ${parts.join(' - ')}\n`;
+    });
+    if (grandTotal) msg += `\n*الإجمالي: ${grandTotal} AED*`;
+
+    await client.sendMessage(GROUP_ID, msg);
+    sendLog.push(Date.now());
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[WhatsApp] Failed to send message:', e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ============================================================================
+//  Login-approval system
+//  Every new browser/device that opens the Merzona tool is locked out until
+//  the owner approves it. The owner is notified instantly on WhatsApp with
+//  one-tap Approve/Deny links. Once approved, a device stays approved until
+//  the owner revokes it from /access/admin.
+// ============================================================================
+
+// Called by the tool when a device requests access (or when the owner opens
+// their one-time "owner bypass" link, which sends adminToken instead).
+app.post('/access/request', async (req, res) => {
+  try {
+    const { deviceToken, name, adminToken } = req.body || {};
+    if (!deviceToken || typeof deviceToken !== 'string' || deviceToken.length < 8) {
+      return res.status(400).json({ error: 'invalid deviceToken' });
+    }
+    const devices = loadDevices();
+
+    // Owner bypass: only works if the caller supplies the real ADMIN_TOKEN (never
+    // shipped inside the tool's own source - the owner pastes it into the URL once).
+    if (adminToken && ADMIN_TOKEN && adminToken === ADMIN_TOKEN) {
+      const prior = devices[deviceToken];
+      devices[deviceToken] = {
+        name: (name || 'Owner device').toString().slice(0, 80),
+        status: 'approved',
+        requestedAt: (prior && prior.requestedAt) || Date.now(),
+        approvedAt: Date.now(),
+        isOwner: true,
+      };
+      saveDevices(devices);
+      return res.json({ status: 'approved' });
+    }
+
+    const existing = devices[deviceToken];
+    if (existing && existing.status === 'approved') return res.json({ status: 'approved' });
+    if (existing && existing.status === 'pending') return res.json({ status: 'pending' });
+
+    if (isAccessRequestRateLimited()) {
+      return res.status(429).json({ error: 'too many requests, try again later' });
+    }
+    accessRequestLog.push(Date.now());
+
+    devices[deviceToken] = {
+      name: (name || 'بدون اسم').toString().trim().slice(0, 80) || 'بدون اسم',
+      status: 'pending',
+      requestedAt: Date.now(),
+    };
+    saveDevices(devices);
+
+    if (clientReady && OWNER_WHATSAPP_NUMBER && PUBLIC_BASE_URL && ADMIN_TOKEN) {
+      const approveUrl = `${PUBLIC_BASE_URL}/access/approve?admin=${encodeURIComponent(ADMIN_TOKEN)}&device=${encodeURIComponent(deviceToken)}&action=approve`;
+      const denyUrl = `${PUBLIC_BASE_URL}/access/approve?admin=${encodeURIComponent(ADMIN_TOKEN)}&device=${encodeURIComponent(deviceToken)}&action=deny`;
+      const msg =
+        `🔐 *طلب دخول جديد لأداة Merzona*\n` +
+        `الاسم: ${devices[deviceToken].name}\n` +
+        `الوقت: ${new Date().toLocaleString('ar-AE')}\n\n` +
+        `✅ للموافقة: ${approveUrl}\n\n` +
+        `⛔ للرفض: ${denyUrl}`;
+      client.sendMessage(OWNER_WHATSAPP_NUMBER + '@c.us', msg).catch((e) => console.error('[Access] Failed to notify owner on WhatsApp:', e));
+    } else {
+      console.warn('[Access] New pending request but WhatsApp notification could not be sent (server not fully configured, or not logged in yet) - check /access/admin manually.');
+    }
+
+    res.json({ status: 'pending' });
+  } catch (e) {
+    console.error('[Access] /access/request failed:', e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// Polled by the tool while it's waiting for approval.
+app.get('/access/status', (req, res) => {
+  const deviceToken = (req.query.device || '').toString();
+  const devices = loadDevices();
+  const entry = devices[deviceToken];
+  if (!entry) return res.json({ status: 'none' });
+  res.json({ status: entry.status, name: entry.name });
+});
+
+// One-tap link the owner opens from the WhatsApp notification (or the admin panel).
+app.get('/access/approve', (req, res) => {
+  const { admin, device, action } = req.query;
+  if (!ADMIN_TOKEN || admin !== ADMIN_TOKEN) {
+    return res.status(401).send('<h2 style="font-family:sans-serif">غير مصرح - Unauthorized</h2>');
+  }
+  const devices = loadDevices();
+  const entry = devices[device];
+  if (!entry) {
+    return res.status(404).send('<h2 style="font-family:sans-serif">الطلب مش موجود (ربما انحذف)</h2>');
+  }
+  if (action === 'approve') {
+    entry.status = 'approved';
+    entry.approvedAt = Date.now();
+  } else if (action === 'deny') {
+    entry.status = 'denied';
+  } else if (action === 'revoke') {
+    entry.status = 'revoked';
+  } else {
+    return res.status(400).send('<h2 style="font-family:sans-serif">إجراء غير معروف</h2>');
+  }
+  devices[device] = entry;
+  saveDevices(devices);
+  const label = { approve: 'تمت الموافقة ✅', deny: 'تم الرفض ⛔', revoke: 'تم إلغاء الوصول ⛔' }[action];
+  res.send(`<html><body style="font-family:sans-serif;text-align:center;padding-top:60px;direction:rtl">
+    <h2>${label}</h2>
+    <p>${escapeHtml(entry.name)}</p>
+    <p><a href="/access/admin?admin=${encodeURIComponent(ADMIN_TOKEN)}">فتح لوحة إدارة الأجهزة</a></p>
+  </body></html>`);
+});
+
+// Full list of devices (pending/approved/denied/revoked) with inline actions - a fallback
+// for when the owner missed the WhatsApp notification, and the only way to revoke access.
+app.get('/access/admin', (req, res) => {
+  if (!ADMIN_TOKEN || req.query.admin !== ADMIN_TOKEN) {
+    return res.status(401).send('<h2 style="font-family:sans-serif">غير مصرح - Unauthorized</h2>');
+  }
+  const devices = loadDevices();
+  const rows = Object.entries(devices)
+    .sort((a, b) => (b[1].requestedAt || 0) - (a[1].requestedAt || 0))
+    .map(([token, d]) => {
+      const badge = { pending: '🟡 بانتظار الموافقة', approved: '🟢 مسموح', denied: '⛔ مرفوض', revoked: '⚫ ملغي' }[d.status] || d.status;
+      const actions = [];
+      if (d.status !== 'approved') actions.push(`<a href="/access/approve?admin=${encodeURIComponent(ADMIN_TOKEN)}&device=${encodeURIComponent(token)}&action=approve">موافقة</a>`);
+      if (d.status !== 'denied' && d.status !== 'approved') actions.push(`<a href="/access/approve?admin=${encodeURIComponent(ADMIN_TOKEN)}&device=${encodeURIComponent(token)}&action=deny">رفض</a>`);
+      if (d.status === 'approved') actions.push(`<a href="/access/approve?admin=${encodeURIComponent(ADMIN_TOKEN)}&device=${encodeURIComponent(token)}&action=revoke" style="color:#c0392b">إلغاء الوصول</a>`);
+      return `<tr>
+        <td>${escapeHtml(d.name || '')}</td>
+        <td>${badge}</td>
+        <td>${d.requestedAt ? new Date(d.requestedAt).toLocaleString('ar-AE') : ''}</td>
+        <td>${actions.join(' | ')}</td>
+      </tr>`;
+    })
+    .join('');
+  res.send(`<html><body style="font-family:sans-serif;padding:24px;direction:rtl">
+    <h2>لوحة إدارة أجهزة الدخول - أداة Merzona</h2>
+    <table border="1" cellpadding="8" style="border-collapse:collapse;width:100%;max-width:800px">
+      <tr><th>الاسم</th><th>الحالة</th><th>وقت الطلب</th><th>إجراء</th></tr>
+      ${rows || '<tr><td colspan="4">ما في طلبات لسا</td></tr>'}
+    </table>
+  </body></html>`);
+});
+
+app.listen(PORT, () => console.log(`[Server] Running on port ${PORT}`));
