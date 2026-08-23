@@ -18,7 +18,7 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const qrcode = require('qrcode');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 
 const PORT = process.env.PORT || 3000;
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
@@ -53,7 +53,9 @@ if (!ADMIN_TOKEN) {
 }
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+// 15mb (not 1mb) because a saved quotation's PDF file now rides along in the same request,
+// base64-encoded (roughly +33% size) - a few-page quotation PDF can be a couple MB.
+app.use(express.json({ limit: '15mb' }));
 app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN }));
 
 let lastQr = null;
@@ -266,7 +268,7 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
   if (isRateLimited()) return res.status(429).json({ error: 'rate limit exceeded' });
 
   try {
-    const { ref, client: clientName, location, mobile, items, grandTotal } = req.body || {};
+    const { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename } = req.body || {};
     if (!Array.isArray(items) || !items.length) {
       return res.status(400).json({ error: 'no items provided' });
     }
@@ -280,18 +282,48 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
     if (location) msg += `الإمارة: ${location}\n`;
     if (mobile) msg += `الموبايل: ${mobile}\n`;
     msg += '\n*البنود:*\n';
-    items.forEach((it, i) => {
+
+    // Group identical items (same name + same price/m²) into one line and sum their
+    // quantity - dimensions are intentionally left out of the message entirely. An item
+    // only appears as a separate line when a DIFFERENT price was set for a similar name.
+    const grouped = new Map();
+    items.forEach((it) => {
       const name = (it.name || '').toString().trim();
       if (!name) return;
-      const dims = it.width && it.height ? `${it.width}×${it.height}mm` : '';
-      const qtyTxt = it.qty ? `×${it.qty}` : '';
-      const priceTxt = it.pricePerM2 ? `${it.pricePerM2} AED/m²` : '';
-      const parts = [name, dims, qtyTxt, priceTxt].filter(Boolean);
-      msg += `${i + 1}. ${parts.join(' - ')}\n`;
+      const price = (it.pricePerM2 || '').toString().trim();
+      const key = name.toLowerCase() + '||' + price;
+      const qty = parseFloat(it.qty) || 1;
+      if (grouped.has(key)) {
+        grouped.get(key).qty += qty;
+      } else {
+        grouped.set(key, { name, price, qty });
+      }
     });
+    let lineNo = 0;
+    for (const g of grouped.values()) {
+      lineNo++;
+      const qtyTxt = g.qty ? `×${g.qty}` : '';
+      const priceTxt = g.price ? `${g.price} AED/m²` : '';
+      const parts = [g.name, qtyTxt, priceTxt].filter(Boolean);
+      msg += `${lineNo}. ${parts.join(' - ')}\n`;
+    }
     if (grandTotal) msg += `\n*الإجمالي: ${grandTotal} AED*`;
 
-    await client.sendMessage(GROUP_ID, msg);
+    // Attach the quotation PDF itself when the tool sent one along - falls back to a
+    // plain text message (still useful) if the PDF is missing or fails to attach for
+    // any reason, so a PDF problem never blocks the notification from going out.
+    if (pdfBase64) {
+      try {
+        const media = new MessageMedia('application/pdf', pdfBase64, (pdfFilename || 'quotation.pdf').toString());
+        await client.sendMessage(GROUP_ID, media, { caption: msg });
+      } catch (mediaErr) {
+        console.error('[WhatsApp] Failed to attach PDF, sending text-only instead:', mediaErr);
+        await client.sendMessage(GROUP_ID, msg);
+      }
+    } else {
+      await client.sendMessage(GROUP_ID, msg);
+    }
+
     sendLog.push(Date.now());
     res.json({ ok: true });
   } catch (e) {
