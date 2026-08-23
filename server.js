@@ -101,6 +101,26 @@ client.on('disconnected', (reason) => {
   console.warn('[WhatsApp] Disconnected:', reason);
 });
 
+// Fallback way to find a group's ID that doesn't rely on client.getChats() - on some
+// WhatsApp Web builds that call fails with an opaque internal error (e.g. "r: r") even
+// though the connection itself is fine. Listening to messages instead uses the raw data
+// that already arrives with each message event, no extra internal calls needed. See the
+// /last-messages route below - send a test message in the group, then open that route.
+const recentMessages = [];
+client.on('message_create', (msg) => {
+  try {
+    recentMessages.unshift({
+      from: msg.from,
+      fromMe: !!msg.fromMe,
+      body: (msg.body || '').toString().slice(0, 80),
+      at: Date.now(),
+    });
+    if (recentMessages.length > 20) recentMessages.length = 20;
+  } catch (e) {
+    console.error('[Debug] Failed to record message:', e);
+  }
+});
+
 // Chrome writes lock files (SingletonLock etc.) into its profile folder while running, and
 // removes them on a clean exit. If the container gets killed mid-crash (exactly what happens
 // while the earlier "missing shared libraries" bug was crash-looping), those lock files are
@@ -228,8 +248,15 @@ app.get('/groups', checkAuth, async (req, res) => {
       .map((c) => ({ id: c.id._serialized, name: c.name }));
     res.json({ groups });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    console.error('[Groups] client.getChats() failed:', e);
+    res.status(500).json({ error: String(e), name: e && e.name, message: e && e.message, hint: 'try /last-messages instead - send a test message in the target group first' });
   }
+});
+
+// Fallback for finding a group's ID when /groups fails: send any test message in the
+// target group from your phone (with the server already connected), then open this.
+app.get('/last-messages', checkAuth, (req, res) => {
+  res.json({ messages: recentMessages });
 });
 
 // Main route: called automatically by the quotation tool on every save.
