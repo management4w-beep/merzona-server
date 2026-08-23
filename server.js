@@ -71,6 +71,15 @@ const client = new Client({
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   },
+  // whatsapp-web.js ships with a bundled/cached WhatsApp Web build. When WhatsApp updates
+  // their own web app, that bundled build can go stale and calls like getChats() then fail
+  // with cryptic minified errors such as "r: r" (an internal error from WhatsApp Web's own
+  // obfuscated code, not from our server). Pinning to a known-compatible build fetched fresh
+  // from a maintained community mirror avoids this instead of relying on the stale local cache.
+  webVersionCache: {
+    type: 'remote',
+    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1023250906-alpha.html',
+  },
 });
 
 client.on('qr', (qr) => {
