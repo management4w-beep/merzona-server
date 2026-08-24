@@ -31,6 +31,38 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://management4w-beep.
 // Volume at exactly this path (see README.md).
 const AUTH_DATA_PATH = process.env.AUTH_DATA_PATH || '/data/.wwebjs_auth';
 
+// ---- Google Drive silent-token service ----
+// حل مشكلة "لازم أكبس موافقة جوجل كل شوي" من جذورها: بدل ما كل متصفح يفتح نافذة جوجل بنفسه (والمتصفح
+// بيمنع هيك نوافذ لو ما كانت نتيجة كبسة حقيقية)، منعمل مرة وحدة بس ربط دائم بين هالسيرفر وحساب جوجل
+// درايف (عبر GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET + refresh token محفوظ)، وبعدها أي أداة (الفاتورة
+// أو الداشبورد) بتطلب توكن جاهز من هالسيرفر مباشرة (/drive-token) بدون ما تحتاج تفتح ولا نافذة جوجل
+// إطلاقًا، ولا حتى مرة كل ساعة - السيرفر هو يلي بيجدد التوكن لحاله بالخلفية طول ما refresh token صالح.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive';
+// نفس الفولدر (Volume) المستمر يلي محفوظ فيه جلسة الواتساب ولائحة الأجهزة - هيك refresh token
+// بيضل موجود حتى لو السيرفر أعاد التشغيل.
+const GOOGLE_REFRESH_TOKEN_PATH = process.env.GOOGLE_REFRESH_TOKEN_PATH || '/data/google-refresh-token.json';
+
+function loadGoogleRefreshToken() {
+  try {
+    return JSON.parse(fs.readFileSync(GOOGLE_REFRESH_TOKEN_PATH, 'utf8')).refresh_token || null;
+  } catch (e) {
+    return null;
+  }
+}
+function saveGoogleRefreshToken(token) {
+  try {
+    fs.mkdirSync(path.dirname(GOOGLE_REFRESH_TOKEN_PATH), { recursive: true });
+    fs.writeFileSync(GOOGLE_REFRESH_TOKEN_PATH, JSON.stringify({ refresh_token: token, savedAt: Date.now() }, null, 2));
+  } catch (e) {
+    console.error('[Drive Auth] Failed to save refresh token:', e);
+  }
+}
+if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+  console.warn('[WARNING] GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set - the /drive-token silent-sync service will not work until you configure them (see README.md).');
+}
+
 // ---- Login-approval system settings ----
 // A secret only the tool's owner knows - used both to approve/deny/revoke device
 // requests, and as a one-time "owner bypass" link opened on the owner's own devices.
@@ -328,6 +360,119 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error('[WhatsApp] Failed to send message:', e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ============================================================================
+//  Google Drive silent-token service
+//  One-time setup (owner only, via /drive-auth/start): links this server to a
+//  Google Drive account and stores a long-lived refresh token. After that,
+//  every tool (Quotation_Generator / Dashboard) can fetch a ready access token
+//  from /drive-token any time, with zero Google popups - not even once an hour.
+// ============================================================================
+
+// Owner-only, one time (or whenever you want to re-link / switch Google accounts):
+// open this URL with ?admin=<ADMIN_TOKEN> from a normal browser, sign in with the
+// Google account that owns the Drive folder, and approve. The server then stores
+// the refresh token itself - no copy/pasting secrets around.
+app.get('/drive-auth/start', (req, res) => {
+  if (!ADMIN_TOKEN || req.query.admin !== ADMIN_TOKEN) {
+    return res.status(401).send('<h2 style="font-family:sans-serif">غير مصرح - Unauthorized</h2>');
+  }
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    return res.status(500).send('<h2 style="font-family:sans-serif">السيرفر مش مجهز بعد</h2><p style="font-family:sans-serif">لازم تضيف GOOGLE_CLIENT_ID و GOOGLE_CLIENT_SECRET بمتغيرات البيئة على Railway أول (شوف README.md).</p>');
+  }
+  if (!PUBLIC_BASE_URL) {
+    return res.status(500).send('<h2 style="font-family:sans-serif">PUBLIC_BASE_URL مش مضبوط</h2>');
+  }
+  const redirectUri = PUBLIC_BASE_URL + '/drive-auth/callback';
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: redirectUri,
+    response_type: 'code',
+    scope: GOOGLE_DRIVE_SCOPE,
+    access_type: 'offline',
+    prompt: 'consent', // بيضمن إنه جوجل يرجع refresh_token دايمًا (حتى لو كنت وافقت قبل هيك من نافذة المتصفح)
+    state: ADMIN_TOKEN,
+  });
+  res.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + params.toString());
+});
+
+// جوجل بيرجع لهون بعد ما توافق - منستبدل الكود بـ refresh token دائم ومنخزنه على السيرفر.
+app.get('/drive-auth/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  if (error) {
+    return res.status(400).send('<h2 style="font-family:sans-serif">صار خطأ من جوجل</h2><p>' + escapeHtml(String(error)) + '</p>');
+  }
+  if (!ADMIN_TOKEN || state !== ADMIN_TOKEN) {
+    return res.status(401).send('<h2 style="font-family:sans-serif">غير مصرح - Unauthorized</h2>');
+  }
+  if (!code) {
+    return res.status(400).send('<h2 style="font-family:sans-serif">ما وصل كود من جوجل</h2>');
+  }
+  try {
+    const redirectUri = PUBLIC_BASE_URL + '/drive-auth/callback';
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code: code.toString(),
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: redirectUri,
+        grant_type: 'authorization_code',
+      }),
+    });
+    const data = await tokenRes.json();
+    if (!tokenRes.ok || !data.refresh_token) {
+      return res.status(502).send(
+        '<div style="font-family:sans-serif;direction:rtl;padding:20px">' +
+        '<h2>ما رجع refresh_token ⚠️</h2>' +
+        '<p>غالبًا لأنك سبق ووافقت قبل هيك ولسا في refresh token شغال من مرة سابقة (جوجل بيرجعه أول مرة بس عادةً). ' +
+        'جرب: روح https://myaccount.google.com/permissions وألغي صلاحية "Merzona" (أو اسم التطبيق يلي حاطينه بـ Google Cloud Console)، وبعدين افتح رابط /drive-auth/start من جديد.</p>' +
+        '<pre style="background:#f4f4f4;padding:10px;white-space:pre-wrap">' + escapeHtml(JSON.stringify(data, null, 2)) + '</pre>' +
+        '</div>'
+      );
+    }
+    saveGoogleRefreshToken(data.refresh_token);
+    res.send('<h2 style="font-family:sans-serif;direction:rtl">تم الربط بنجاح ✅</h2><p style="font-family:sans-serif;direction:rtl">هلق كل الأدوات فيها تاخد توكن جوجل درايف تلقائيًا بدون أي نافذة أو كبسة. تقدر تسكر هالصفحة.</p>');
+  } catch (e) {
+    console.error('[Drive Auth] Callback failed:', e);
+    res.status(500).send('<h2 style="font-family:sans-serif">صار خطأ</h2><pre>' + escapeHtml(String(e)) + '</pre>');
+  }
+});
+
+// بتنادى عليه أداة الفاتورة والداشبورد عوضًا عن ما تفتح نافذة جوجل بنفسها - بيرجع توكن جاهز صالح
+// لساعة تقريبًا، مبني على الـ refresh token المخزّن فوق. نفس AUTH_TOKEN تبع بقية السيرفر (x-api-key
+// أو ?token=) - حتى ما يقدر أي حدا غريب يطلب توكن درايف حي من هون.
+app.get('/drive-token', checkAuth, async (req, res) => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    return res.status(500).json({ error: 'not-configured' });
+  }
+  const refreshToken = loadGoogleRefreshToken();
+  if (!refreshToken) {
+    return res.status(503).json({ error: 'not-linked-yet' });
+  }
+  try {
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+      }),
+    });
+    const data = await tokenRes.json();
+    if (!tokenRes.ok || !data.access_token) {
+      console.error('[Drive Token] Refresh failed:', data);
+      return res.status(502).json({ error: 'refresh-failed', detail: data });
+    }
+    res.json({ access_token: data.access_token, expires_in: data.expires_in || 3600 });
+  } catch (e) {
+    console.error('[Drive Token] Failed:', e);
     res.status(500).json({ error: String(e) });
   }
 });
