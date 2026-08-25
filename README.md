@@ -114,6 +114,81 @@ your own number. That means:
   hosting (Railway) instead of living on GitHub Pages with the rest of the
   tool.
 
+## Google Drive silent-token service (no more Google popups)
+
+Solves "I have to click Sync / approve Google every time I open the tool."
+One-time setup, then every tool gets a ready Drive token from this server —
+no Google window ever, not even once an hour.
+
+- [ ] **1.** Go to [Google Cloud Console](https://console.cloud.google.com/apis/credentials),
+  open the OAuth 2.0 Client ID already used by the tool
+  (`575144277793-dgh7oslo72umva7cb37rpa82tman9vfm.apps.googleusercontent.com`),
+  and copy its **Client secret**.
+- [ ] **2.** In that same client's **Authorized redirect URIs**, add:
+  `<your-url>/drive-auth/callback` (exactly, no trailing slash) — save.
+- [ ] **3.** In Railway → Variables, add:
+  ```
+  GOOGLE_CLIENT_ID=575144277793-dgh7oslo72umva7cb37rpa82tman9vfm.apps.googleusercontent.com
+  GOOGLE_CLIENT_SECRET=✏️ paste the client secret from step 1
+  ```
+- [ ] **4.** Open `<your-url>/drive-auth/start?admin=<ADMIN_TOKEN>` in a
+  browser, sign in with the Google account that owns the Drive folder, and
+  approve. You'll see "تم الربط بنجاح ✅" — that's it, one time only. The
+  server stores what it needs on the same `/data` Volume from step 4 above.
+- [ ] **5.** That's it — `Quotation_Generator.html` and `Dashboard.html`
+  already call this service first automatically (already wired in the code).
+  If the server is ever unreachable, they fall back to the old
+  browser-popup method on their own, so nothing breaks either way.
+
+**If you ever need to re-link** (switched Google accounts, or see
+`not-linked-yet` / `refresh-failed` errors): just open
+`<your-url>/drive-auth/start?admin=<ADMIN_TOKEN>` again.
+
+## Electronic contract signing (client e-signature)
+
+Lets a client sign a quotation from their phone (draw their signature, no
+app/account needed) instead of printing and signing on paper. The quotation's
+"Client Signature" box now shows a QR code + link — the client taps/scans it,
+signs on a simple web page, and:
+
+- gets an instant download of the signed contract PDF (the original
+  quotation with a signature certificate page appended),
+- the contract is added to the Dashboard's "العقود" (Contracts) tab
+  automatically, with the signed PDF attached,
+- a copy is sent to a dedicated WhatsApp group for signed contracts.
+
+This reuses the same Google Drive link from the section above — nothing
+extra to set up there. Two new things needed:
+
+- [ ] **1.** Upload `sign.html` to your GitHub Pages repo, alongside
+  `index.html`/`Dashboard.html` (**Add file → Upload files → Commit
+  changes**, same as always). It's a public page with no login — that's
+  intentional, since your clients don't have accounts on the tool.
+- [ ] **2.** Create a new WhatsApp group called e.g. "العقود" (or any name
+  you like), add the linked WhatsApp number to it, then open
+  `<your-url>/groups?token=<AUTH_TOKEN>` and find its `id` (same way you
+  found `GROUP_ID` originally). In Railway → Variables, add:
+  ```
+  CONTRACTS_GROUP_ID=✏️ paste the id you just found
+  ```
+
+That's it — the next quotation you save will already show the QR/sign link
+in its "Client Signature" box. Older, already-sent quotations only get the
+new sign box once you edit and re-save them from the updated tool (or the
+client can still just sign the paper copy as before — nothing is broken for
+existing quotations).
+
+**Notes:**
+- Rendering the signature certificate page reuses the same Chromium
+  installed in the Dockerfile for WhatsApp — no extra system setup needed on
+  Railway.
+- A signing link only works for the one quotation it was generated for, and
+  stops meaning anything useful to a stranger even if guessed — each
+  quotation gets its own long random code, checked on every request.
+- If a client re-opens a link after already signing, they just see a
+  "already signed" screen with a download button instead of being able to
+  sign again.
+
 ## Managing things afterward
 
 - **Missed a WhatsApp access-request notification?** Open
