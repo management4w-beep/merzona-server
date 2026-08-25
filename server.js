@@ -304,69 +304,79 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
   if (!GROUP_ID) return res.status(500).json({ error: 'GROUP_ID not set on the server - see README.md' });
   if (isRateLimited()) return res.status(429).json({ error: 'rate limit exceeded' });
 
-  try {
-    const { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename } = req.body || {};
-    if (!Array.isArray(items) || !items.length) {
-      return res.status(400).json({ error: 'no items provided' });
-    }
+  const { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename } = req.body || {};
+  if (!Array.isArray(items) || !items.length) {
+    return res.status(400).json({ error: 'no items provided' });
+  }
 
-    // NOTE: the outgoing WhatsApp message text below is in Arabic on purpose,
-    // since that's the language of the "Tasks" group / the team reading it.
-    // Only this file's comments and API responses were translated to English.
-    let msg = '📋 *عرض سعر جديد - Merzona*\n';
-    if (ref) msg += `المرجع: ${ref}\n`;
-    if (clientName) msg += `العميل: ${clientName}\n`;
-    if (location) msg += `الإمارة: ${location}\n`;
-    if (mobile) msg += `الموبايل: ${mobile}\n`;
-    msg += '\n*البنود:*\n';
+  // 🔧 إصلاح 2026-08-25: نرد على المتصفح فورًا هون (بعد التحقق من صحة البيانات بس)، قبل
+  // ما نبعت فعليًا عبر واتساب. سبب الإصلاح: client.sendMessage() مع مرفق PDF عبر
+  // whatsapp-web.js ممكن ياخد كذا ثانية (بتفتح/تتحكم بمتصفح داخلي)، وإذا تخطينا مهلة
+  // الاتصال (سواء عند Railway أو بالمتصفح نفسه)، الاتصال بينقطع قبل ما يوصل الرد -
+  // والمتصفح بيسجلها غلط كأنها مشكلة CORS ("Failed to fetch") رغم إنو غالبًا الرسالة
+  // نفسها بتكون انبعتت أو بتنبعث لاحقًا. هلق منرد فورًا ومنكمل الإرسال الفعلي بالخلفية،
+  // ومنسجل أي فشل حقيقي بلوغ السيرفر (Railway logs) بدل ما نخلي المتصفح ينتظره.
+  res.json({ ok: true, queued: true });
 
-    // Group identical items (same name + same price/m²) into one line and sum their
-    // quantity - dimensions are intentionally left out of the message entirely. An item
-    // only appears as a separate line when a DIFFERENT price was set for a similar name.
-    const grouped = new Map();
-    items.forEach((it) => {
-      const name = (it.name || '').toString().trim();
-      if (!name) return;
-      const price = (it.pricePerM2 || '').toString().trim();
-      const key = name.toLowerCase() + '||' + price;
-      const qty = parseFloat(it.qty) || 1;
-      if (grouped.has(key)) {
-        grouped.get(key).qty += qty;
-      } else {
-        grouped.set(key, { name, price, qty });
+  (async () => {
+    try {
+      // NOTE: the outgoing WhatsApp message text below is in Arabic on purpose,
+      // since that's the language of the "Tasks" group / the team reading it.
+      // Only this file's comments and API responses were translated to English.
+      let msg = '📋 *عرض سعر جديد - Merzona*\n';
+      if (ref) msg += `المرجع: ${ref}\n`;
+      if (clientName) msg += `العميل: ${clientName}\n`;
+      if (location) msg += `الإمارة: ${location}\n`;
+      if (mobile) msg += `الموبايل: ${mobile}\n`;
+      msg += '\n*البنود:*\n';
+
+      // Group identical items (same name + same price/m²) into one line and sum their
+      // quantity - dimensions are intentionally left out of the message entirely. An item
+      // only appears as a separate line when a DIFFERENT price was set for a similar name.
+      const grouped = new Map();
+      items.forEach((it) => {
+        const name = (it.name || '').toString().trim();
+        if (!name) return;
+        const price = (it.pricePerM2 || '').toString().trim();
+        const key = name.toLowerCase() + '||' + price;
+        const qty = parseFloat(it.qty) || 1;
+        if (grouped.has(key)) {
+          grouped.get(key).qty += qty;
+        } else {
+          grouped.set(key, { name, price, qty });
+        }
+      });
+      let lineNo = 0;
+      for (const g of grouped.values()) {
+        lineNo++;
+        const qtyTxt = g.qty ? `×${g.qty}` : '';
+        const priceTxt = g.price ? `${g.price} AED/m²` : '';
+        const parts = [g.name, qtyTxt, priceTxt].filter(Boolean);
+        msg += `${lineNo}. ${parts.join(' - ')}\n`;
       }
-    });
-    let lineNo = 0;
-    for (const g of grouped.values()) {
-      lineNo++;
-      const qtyTxt = g.qty ? `×${g.qty}` : '';
-      const priceTxt = g.price ? `${g.price} AED/m²` : '';
-      const parts = [g.name, qtyTxt, priceTxt].filter(Boolean);
-      msg += `${lineNo}. ${parts.join(' - ')}\n`;
-    }
-    if (grandTotal) msg += `\n*الإجمالي: ${grandTotal} AED*`;
+      if (grandTotal) msg += `\n*الإجمالي: ${grandTotal} AED*`;
 
-    // Attach the quotation PDF itself when the tool sent one along - falls back to a
-    // plain text message (still useful) if the PDF is missing or fails to attach for
-    // any reason, so a PDF problem never blocks the notification from going out.
-    if (pdfBase64) {
-      try {
-        const media = new MessageMedia('application/pdf', pdfBase64, (pdfFilename || 'quotation.pdf').toString());
-        await client.sendMessage(GROUP_ID, media, { caption: msg });
-      } catch (mediaErr) {
-        console.error('[WhatsApp] Failed to attach PDF, sending text-only instead:', mediaErr);
+      // Attach the quotation PDF itself when the tool sent one along - falls back to a
+      // plain text message (still useful) if the PDF is missing or fails to attach for
+      // any reason, so a PDF problem never blocks the notification from going out.
+      if (pdfBase64) {
+        try {
+          const media = new MessageMedia('application/pdf', pdfBase64, (pdfFilename || 'quotation.pdf').toString());
+          await client.sendMessage(GROUP_ID, media, { caption: msg });
+        } catch (mediaErr) {
+          console.error('[WhatsApp] Failed to attach PDF, sending text-only instead:', mediaErr);
+          await client.sendMessage(GROUP_ID, msg);
+        }
+      } else {
         await client.sendMessage(GROUP_ID, msg);
       }
-    } else {
-      await client.sendMessage(GROUP_ID, msg);
-    }
 
-    sendLog.push(Date.now());
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[WhatsApp] Failed to send message:', e);
-    res.status(500).json({ error: String(e) });
-  }
+      sendLog.push(Date.now());
+      console.log('[WhatsApp] ✅ تم إرسال عرض السعر بنجاح (بالخلفية) - المرجع:', ref || '(بدون مرجع)');
+    } catch (e) {
+      console.error('[WhatsApp] Failed to send message (background):', e);
+    }
+  })();
 });
 
 // ============================================================================
