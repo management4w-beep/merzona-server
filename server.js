@@ -726,6 +726,58 @@ async function mergeCertificateIntoPdf(originalPdfBuffer, certPdfBuffer) {
   return Buffer.from(bytes);
 }
 
+// طلب حمدي (2026-08-27): بدل ما نلحق صفحة "شهادة توقيع" منفصلة بآخر الملف، منرسم توقيع الزبون
+// الحقيقي (صورة PNG بخلفية شفافة، من لوحة الرسم بصفحة sign.html) مباشرة فوق صندوق "Client Signature"
+// الأصلي بنفس مكانه بالضبط - بالاعتماد على إحداثياته (data.signBoxRect) اللي أداة عروض الأسعار
+// حسبتها وحفظتها بملف بيانات العرض (-data.json) وقت آخر مرة انحفظ فيها هالعرض/العقد لجوجل درايف.
+// لو عرض سعر قديم ما عنده هالإحداثيات أصلًا (اتحفظ لجوجل درايف قبل ما هالميزة تنضاف)، أو صار أي
+// خطأ، منرجع null - والكود يلي نادى الدالة بيرجع تلقائيًا للطريقة القديمة (صفحة شهادة ملحقة) كحل احتياطي.
+async function overlaySignatureOnOriginalPdf(originalPdfBuffer, signBoxRect, signatureDataUrl) {
+  if (!signBoxRect || typeof signBoxRect.pageIndex !== 'number') return null;
+  const base64Match = String(signatureDataUrl || '').match(/^data:image\/png;base64,(.+)$/);
+  if (!base64Match) return null;
+
+  const mainDoc = await PDFDocument.load(originalPdfBuffer);
+  const pages = mainDoc.getPages();
+  if (!pages.length) return null;
+  const pageIndex = Math.min(Math.max(signBoxRect.pageIndex, 0), pages.length - 1);
+  const page = pages[pageIndex];
+
+  const pngBytes = Buffer.from(base64Match[1], 'base64');
+  const pngImage = await mainDoc.embedPng(pngBytes);
+
+  const MM_TO_PT = 2.834645669;
+  const boxXPt = signBoxRect.xMm * MM_TO_PT;
+  const boxWPt = signBoxRect.wMm * MM_TO_PT;
+  const boxHPt = signBoxRect.hMm * MM_TO_PT;
+  const boxYFromTopPt = signBoxRect.yMm * MM_TO_PT;
+  const pageHeightPt = page.getHeight();
+  // pdf-lib: أصل الإحداثيات بالزاوية السفلية اليسار (y بيكبر لفوق) - عكس getBoundingClientRect
+  // (أصلها بالزاوية العلوية اليسار، y بيكبر لتحت) يلي حسبنا فيه xMm/yMm بأداة عروض الأسعار.
+  const boxYPt = pageHeightPt - boxYFromTopPt - boxHPt;
+
+  // نلائم صورة التوقيع جوا الصندوق مع الحفاظ على أبعادها الأصلية (بدون تمطيط) - مع هامش أمان 15%
+  // حتى ما تلمس حواف الصندوق، بغض النظر عن نسبة أبعاد لوحة الرسم عند الزبون (موبايل/كمبيوتر مختلفين).
+  const imgAspect = pngImage.width / pngImage.height;
+  const boxAspect = boxWPt / boxHPt;
+  const FIT_RATIO = 0.85;
+  let drawW, drawH;
+  if (imgAspect > boxAspect) {
+    drawW = boxWPt * FIT_RATIO;
+    drawH = drawW / imgAspect;
+  } else {
+    drawH = boxHPt * FIT_RATIO;
+    drawW = drawH * imgAspect;
+  }
+  const drawX = boxXPt + (boxWPt - drawW) / 2;
+  const drawY = boxYPt + (boxHPt - drawH) / 2;
+
+  page.drawImage(pngImage, { x: drawX, y: drawY, width: drawW, height: drawH });
+
+  const bytes = await mainDoc.save();
+  return Buffer.from(bytes);
+}
+
 async function sendSignedContractToWhatsApp({ ref, clientName, total, signerName, pdfBuffer }) {
   if (!clientReady) throw new Error('whatsapp-not-ready');
   if (!CONTRACTS_GROUP_ID) throw new Error('CONTRACTS_GROUP_ID not set on the server - see README.md');
@@ -821,8 +873,21 @@ app.post('/sign/:ref', async (req, res) => {
     const clientName = (data.fields && data.fields['m-client']) || '';
     const total = data.grandTotal || 0;
 
-    const certPdfBuffer = await renderCertificatePdf({ ref, clientName, total, signerName: cleanSignerName, signatureDataUrl, signedAtIso });
-    const mergedPdfBuffer = await mergeCertificateIntoPdf(originalPdfBuffer, certPdfBuffer);
+    // 🆕 2026-08-27: أولوية لرسم توقيع الزبون الحقيقي مباشرة فوق صندوق "Client Signature" الأصلي
+    // بنفس مكانه بالضبط (طلب حمدي) - وبس لو ما نجحت (مثلاً عرض سعر قديم من قبل هالميزة، ما عنده
+    // إحداثيات signBoxRect محفوظة، أو صار أي خطأ تقني)، منرجع للطريقة القديمة الاحتياطية (صفحة
+    // "شهادة توقيع إلكتروني" ملحقة بآخر الملف).
+    let mergedPdfBuffer = null;
+    try {
+      mergedPdfBuffer = await overlaySignatureOnOriginalPdf(originalPdfBuffer, data.signBoxRect, signatureDataUrl);
+    } catch (overlayErr) {
+      console.error('[Sign] Failed to overlay signature on original signature box, falling back to certificate page:', overlayErr);
+      mergedPdfBuffer = null;
+    }
+    if (!mergedPdfBuffer) {
+      const certPdfBuffer = await renderCertificatePdf({ ref, clientName, total, signerName: cleanSignerName, signatureDataUrl, signedAtIso });
+      mergedPdfBuffer = await mergeCertificateIntoPdf(originalPdfBuffer, certPdfBuffer);
+    }
 
     const filesFolderId = await driveFindOrCreateFolder('عقود مرفقة', refFolderId, driveToken);
     const uploaded = await driveUploadBuffer(ref + '-signed.pdf', 'application/pdf', mergedPdfBuffer, filesFolderId, driveToken);
