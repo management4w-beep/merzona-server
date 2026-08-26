@@ -1214,10 +1214,22 @@ function normalizeUsername(u) {
 // الرئيسية" (الإحصائيات المالية، الرسم البياني، سجل العروض) لأنها فيها معلومات حساسة - مستخدم
 // ممكن يكون مسموحلو يدخل Dashboard.html ويستخدم تبويب معيّن (متل المشتريات) بدون ما يشوف
 // الشاشة الرئيسية الحساسة.
-const PERMISSION_KEYS = ['dashboard', 'dashboardHome', 'quotation', 'procurement', 'contracts', 'pmp', 'backup', 'files', 'teamSync', 'manageUsers'];
+// 🆕 2026-08-26 (تفصيل أكتر): "اللوحة الرئيسية" (dashboardHome) نفسها فيها كذا قسم لحاله، وكل
+// قسم فيه معلومات حساسة بمستوى مختلف - فصلناهم لصلاحيات مستقلة حتى الأدمن يقدر "يشيل ويضيف"
+// أجزاء محددة منها لمستخدم معيّن (مثلاً يسمحلو يشوف الرسم البياني بس يمنعو عن سجل العروض).
+// هاي الأربعة بس شغالة إذا dashboardHome أصلاً مسموحة (وإلا الشاشة كلها مخفية من الأساس).
+const PERMISSION_KEYS = [
+  'dashboard', 'dashboardHome',
+  'dashKpis', 'dashExpectedPayments', 'dashChart', 'dashLog',
+  'quotation', 'procurement', 'contracts', 'pmp', 'backup', 'files', 'teamSync', 'manageUsers',
+];
 const DEFAULT_PERMISSIONS = {
   dashboard: true,
   dashboardHome: true,
+  dashKpis: true,
+  dashExpectedPayments: true,
+  dashChart: true,
+  dashLog: true,
   quotation: true,
   procurement: true,
   contracts: true,
