@@ -324,7 +324,7 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
   if (!GROUP_ID) return res.status(500).json({ error: 'GROUP_ID not set on the server - see README.md' });
   if (isRateLimited()) return res.status(429).json({ error: 'rate limit exceeded' });
 
-  const { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename } = req.body || {};
+  const { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename, createdBy } = req.body || {};
   if (!Array.isArray(items) || !items.length) {
     return res.status(400).json({ error: 'no items provided' });
   }
@@ -348,6 +348,9 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
       if (clientName) msg += `العميل: ${clientName}\n`;
       if (location) msg += `الإمارة: ${location}\n`;
       if (mobile) msg += `الموبايل: ${mobile}\n`;
+      // 🆕 2026-08-26: اسم الشخص يلي أنشأ عرض السعر (من حساب المستخدم تبعو) - سطر اختياري، بيظهر
+      // بس لو الأداة بعتت اسم فعلي (مثلاً المالك عن طريق رابط #owner= ما إلو حساب فما بيظهر السطر).
+      if (createdBy) msg += `تم إنشاؤه بواسطة: ${createdBy}\n`;
       msg += '\n*البنود:*\n';
 
       // Group identical items (same name + same price/m²) into one line and sum their
