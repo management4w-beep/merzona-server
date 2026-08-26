@@ -110,16 +110,26 @@ const client = new Client({
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   },
-  // whatsapp-web.js ships with a bundled/cached WhatsApp Web build. When WhatsApp updates
-  // their own web app, that bundled build can go stale and calls like getChats() then fail
-  // with cryptic minified errors such as "r: r" (an internal error from WhatsApp Web's own
-  // obfuscated code, not from our server). Pinning to a known-compatible build fetched fresh
-  // from a maintained community mirror avoids this instead of relying on the stale local cache.
+  // 🔧 2026-08-26: شلنا تثبيت نسخة WhatsApp Web على ملف محدد بمستودع خارجي (كان هون قبل).
+  // السبب: هيك مصادر (raw.githubusercontent.com/wppconnect-team/wa-version) بتشيل/بتغيّر أسماء
+  // الملفات القديمة بشكل دوري - ولما الملف المثبّت عليه يختفي أو يصير فيه مشكلة بالجلب، الـ
+  // client.initialize() بيعلق (hang) بصمت: ما بيطلع QR، ما بيصير ready، وما بيطبع ولا خطأ - بالضبط
+  // نفس العرض يلي شفناه (health دايمًا false و/qr دايمًا "still starting up"). رجّعنا الإعداد
+  // الافتراضي (type: 'local') يلي بياخد نسخة WhatsApp Web مباشرة من نفس الصفحة وقت تحميلها،
+  // بدون اعتماد على أي ملف خارجي ثابت ممكن يختفي أو يتغيّر اسمه.
   webVersionCache: {
-    type: 'remote',
-    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1023250906-alpha.html',
+    type: 'local',
   },
 });
+
+// شبكة أمان: إذا خلص 60 ثانية من بعد initialize() وما صار ready ولا طلع QR، هاد دليل قوي إنو
+// في تعليق (hang) بمكان ما (شبكة، تحميل صفحة واتساب، أو مشكلة بالجلسة المحفوظة) - نطبع تحذير
+// واضح بالـlogs بدل ما يضل السيرفر ساكت وما حدا يعرف ليش.
+setTimeout(() => {
+  if (!clientReady && !lastQr) {
+    console.warn('[WhatsApp] ⚠️ مرت 60 ثانية وما صار ready وما طلع QR - غالبًا في تعليق (hang) بتحميل واتساب ويب أو بالجلسة المحفوظة. جرب تمسح مجلد الجلسة (' + AUTH_DATA_PATH + ') من الـVolume وأعد النشر لتبلش جلسة نظيفة.');
+  }
+}, 60000);
 
 client.on('qr', (qr) => {
   lastQr = qr;
@@ -194,7 +204,10 @@ function cleanupStaleChromeLocks(rootDir) {
 }
 cleanupStaleChromeLocks(AUTH_DATA_PATH);
 
-client.initialize();
+console.log('[WhatsApp] بدأنا initialize() - عم نحاول نفتح كروميوم ونحمّل واتساب ويب...');
+client.initialize().catch((e) => {
+  console.error('[WhatsApp] initialize() فشلت:', e);
+});
 
 function checkAuth(req, res, next) {
   const token = req.headers['x-api-key'] || req.query.token;
