@@ -960,6 +960,24 @@ app.get('/sign/:ref/pdf', async (req, res) => {
 //  the owner revokes it from /access/admin.
 // ============================================================================
 
+// بتبعت إشعار الواتساب للمالك عن طلب دخول جهاز (جديد أو معاد إرسالو). مفصولة بدالة لحالها حتى
+// نقدر نستخدمها هون وبمسار إعادة الإرسال (شوف الباغ الموصوف تحت بـ/access/request) من دون تكرار كود.
+function notifyOwnerOfAccessRequest(deviceToken, name) {
+  if (!(clientReady && OWNER_WHATSAPP_NUMBER && PUBLIC_BASE_URL && ADMIN_TOKEN)) {
+    console.warn('[Access] Pending request but WhatsApp notification could not be sent (server not fully configured, or not logged in yet) - check /access/admin manually.');
+    return;
+  }
+  const approveUrl = `${PUBLIC_BASE_URL}/access/approve?admin=${encodeURIComponent(ADMIN_TOKEN)}&device=${encodeURIComponent(deviceToken)}&action=approve`;
+  const denyUrl = `${PUBLIC_BASE_URL}/access/approve?admin=${encodeURIComponent(ADMIN_TOKEN)}&device=${encodeURIComponent(deviceToken)}&action=deny`;
+  const msg =
+    `🔐 *طلب دخول جديد لأداة Merzona*\n` +
+    `الاسم: ${name}\n` +
+    `الوقت: ${new Date().toLocaleString('ar-AE')}\n\n` +
+    `✅ للموافقة: ${approveUrl}\n\n` +
+    `⛔ للرفض: ${denyUrl}`;
+  client.sendMessage(OWNER_WHATSAPP_NUMBER + '@c.us', msg).catch((e) => console.error('[Access] Failed to notify owner on WhatsApp:', e));
+}
+
 // Called by the tool when a device requests access (or when the owner opens
 // their one-time "owner bypass" link, which sends adminToken instead).
 app.post('/access/request', async (req, res) => {
@@ -987,33 +1005,38 @@ app.post('/access/request', async (req, res) => {
 
     const existing = devices[deviceToken];
     if (existing && existing.status === 'approved') return res.json({ status: 'approved' });
-    if (existing && existing.status === 'pending') return res.json({ status: 'pending' });
+    if (existing && existing.status === 'pending') {
+      // 🔧 2026-08-28: باغ كان موجود من قبل - لو أول طلب دخول لجهاز معيّن صار بلحظة ما قدر
+      // فيها السيرفر يبعت إشعار الواتساب (مثلاً كان متعطل أو الواتساب مش متصل بعد)، الجهاز كان
+      // يضل "قيد الانتظار" للأبد بدون أي إشعار - لأنو أي محاولة تانية من نفس الجهاز كانت ترجع
+      // فورًا هون بدون ما توصل لكود إرسال الواتساب إطلاقًا. هلق منعطي فرصة لإعادة إرسال الإشعار
+      // كل ما حدا يعيد المحاولة من نفس الجهاز، بس بحد أقصى مرة كل دقيقتين حتى ما يصير فيضان
+      // رسائل لو حدا ضل يفتح/يسكر الصفحة أو يعيد تحميلها بشكل متكرر.
+      const RESEND_COOLDOWN_MS = 2 * 60 * 1000;
+      const lastNotifiedAt = existing.lastNotifiedAt || existing.requestedAt || 0;
+      if (Date.now() - lastNotifiedAt > RESEND_COOLDOWN_MS) {
+        existing.lastNotifiedAt = Date.now();
+        saveDevices(devices);
+        notifyOwnerOfAccessRequest(deviceToken, existing.name);
+      }
+      return res.json({ status: 'pending' });
+    }
 
     if (isAccessRequestRateLimited()) {
       return res.status(429).json({ error: 'too many requests, try again later' });
     }
     accessRequestLog.push(Date.now());
 
+    const cleanName = (name || 'بدون اسم').toString().trim().slice(0, 80) || 'بدون اسم';
     devices[deviceToken] = {
-      name: (name || 'بدون اسم').toString().trim().slice(0, 80) || 'بدون اسم',
+      name: cleanName,
       status: 'pending',
       requestedAt: Date.now(),
+      lastNotifiedAt: Date.now(),
     };
     saveDevices(devices);
 
-    if (clientReady && OWNER_WHATSAPP_NUMBER && PUBLIC_BASE_URL && ADMIN_TOKEN) {
-      const approveUrl = `${PUBLIC_BASE_URL}/access/approve?admin=${encodeURIComponent(ADMIN_TOKEN)}&device=${encodeURIComponent(deviceToken)}&action=approve`;
-      const denyUrl = `${PUBLIC_BASE_URL}/access/approve?admin=${encodeURIComponent(ADMIN_TOKEN)}&device=${encodeURIComponent(deviceToken)}&action=deny`;
-      const msg =
-        `🔐 *طلب دخول جديد لأداة Merzona*\n` +
-        `الاسم: ${devices[deviceToken].name}\n` +
-        `الوقت: ${new Date().toLocaleString('ar-AE')}\n\n` +
-        `✅ للموافقة: ${approveUrl}\n\n` +
-        `⛔ للرفض: ${denyUrl}`;
-      client.sendMessage(OWNER_WHATSAPP_NUMBER + '@c.us', msg).catch((e) => console.error('[Access] Failed to notify owner on WhatsApp:', e));
-    } else {
-      console.warn('[Access] New pending request but WhatsApp notification could not be sent (server not fully configured, or not logged in yet) - check /access/admin manually.');
-    }
+    notifyOwnerOfAccessRequest(deviceToken, cleanName);
 
     res.json({ status: 'pending' });
   } catch (e) {
