@@ -42,7 +42,12 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
 COPY package.json ./
-RUN npm install --omit=dev
+# 🔧 2026-08-28: --no-audit مضافة عمدًا هون (مو بس لتسريع التثبيت) - آخر نشرة فشلت بنفس خطأ
+# "libglib-2.0.so.0" رغم إنو محتوى هالملف سليم، لأنو Docker/Railway استخدم طبقة (layer) قديمة
+# متخزنة بالكاش لخطوة npm install من قبل ما تنضبط PUPPETEER_SKIP_DOWNLOAD/EXECUTABLE_PATH صح.
+# تغيير أمر الـRUN هون (ولو بشكل بسيط) يجبر إعادة تنفيذ هالخطوة من الصفر بدل الاعتماد عالطبقة
+# القديمة العالقة، فيضمن التثبيت الطازة يستخدم إعدادات كروميوم الصحيحة فعليًا.
+RUN npm install --omit=dev --no-audit
 COPY . .
 
 CMD ["node", "server.js"]
