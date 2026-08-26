@@ -15,6 +15,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const qrcode = require('qrcode');
@@ -81,6 +82,12 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 // Where the approved/pending device list is stored - same persistent Volume as the
 // WhatsApp login session, so it also survives restarts.
 const ACCESS_DATA_PATH = process.env.ACCESS_DATA_PATH || '/data/access-devices.json';
+// 🆕 2026-08-26: نظام حسابات المستخدمين (يوزرنيم/باسوورد) - طبقة إضافية فوق نظام موافقة
+// الواتساب الحالي (ما بيلغيه). كل جهاز موافق عليه لازم ينشئ حساب مرة وحدة، وبعدين الأدمن من
+// صفحة "المستخدمين" بالداشبورد فيه يتحكم بصلاحيات كل حساب لحاله (شو الأدوات/الأقسام يقدر يشوفها).
+// نفس نمط تخزين access-devices.json - ملفات JSON على نفس الـVolume الدائم حتى تنعاش بعد إعادة التشغيل.
+const USERS_DATA_PATH = process.env.USERS_DATA_PATH || '/data/users.json';
+const SESSIONS_DATA_PATH = process.env.SESSIONS_DATA_PATH || '/data/user-sessions.json';
 
 if (!AUTH_TOKEN) {
   console.warn('[WARNING] No AUTH_TOKEN set in environment variables - anyone who knows the server URL can use it!');
@@ -1128,6 +1135,321 @@ app.get('/access/admin', (req, res) => {
       ${rows || '<tr><td colspan="4">ما في طلبات لسا</td></tr>'}
     </table>
   </body></html>`);
+});
+
+// ============================================================================
+//  🆕 2026-08-26: نظام حسابات المستخدمين (يوزرنيم + باسوورد) وصلاحياتهم
+//  ============================================================================
+//  طبقة إضافية فوق نظام موافقة الواتساب - ما بتلغيه ولا بتستبدلو. أي جهاز صار
+//  "approved" بنظام devices القديم، أول ما يفتح الأداة لازم ينشئ حساب (يوزرنيم +
+//  باسوورد) مرة وحدة. بعدين هالحساب هو يلي بيحدد شو يقدر يشوف/يستخدم من أدوات
+//  وأقسام ميرزونا (عرض أسعار، مشتريات، عقود، إلخ) - يتحكم فيها الأدمن من تبويب
+//  "المستخدمين" بالداشبورد. كلمات المرور مخزنة مشفّرة (scrypt + salt عشوائي لكل
+//  مستخدم) - ما منخزن ولا منشوف كلمة المرور الحقيقية أبدًا.
+// ============================================================================
+
+function loadUsers() {
+  try {
+    return JSON.parse(fs.readFileSync(USERS_DATA_PATH, 'utf8'));
+  } catch (e) {
+    return {};
+  }
+}
+function saveUsers(users) {
+  try {
+    fs.mkdirSync(path.dirname(USERS_DATA_PATH), { recursive: true });
+    fs.writeFileSync(USERS_DATA_PATH, JSON.stringify(users, null, 2));
+  } catch (e) {
+    console.error('[Users] Failed to save users store:', e);
+  }
+}
+function loadSessions() {
+  try {
+    return JSON.parse(fs.readFileSync(SESSIONS_DATA_PATH, 'utf8'));
+  } catch (e) {
+    return {};
+  }
+}
+function saveSessions(sessions) {
+  try {
+    fs.mkdirSync(path.dirname(SESSIONS_DATA_PATH), { recursive: true });
+    fs.writeFileSync(SESSIONS_DATA_PATH, JSON.stringify(sessions, null, 2));
+  } catch (e) {
+    console.error('[Users] Failed to save sessions store:', e);
+  }
+}
+
+// scrypt + salt عشوائي لكل مستخدم - قياسي وآمن وما بيحتاج أي مكتبة خارجية إضافية
+// (بدنا نتفادى إضافة اعتمادية جديدة زي bcrypt بهالمرحلة الحساسة، بعد المشكلة يلي
+// صارت مع Puppeteer/Chromium بسبب اعتمادية خارجية).
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return salt + ':' + hash;
+}
+function verifyPassword(password, stored) {
+  if (!stored || typeof stored !== 'string' || stored.indexOf(':') === -1) return false;
+  const [salt, hash] = stored.split(':');
+  try {
+    const hashBuffer = Buffer.from(hash, 'hex');
+    const testHash = crypto.scryptSync(String(password), salt, 64);
+    if (testHash.length !== hashBuffer.length) return false;
+    return crypto.timingSafeEqual(testHash, hashBuffer);
+  } catch (e) {
+    return false;
+  }
+}
+function newSessionToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+function normalizeUsername(u) {
+  return String(u || '').trim().toLowerCase();
+}
+
+// شو الأقسام/الأدوات يلي فيها صلاحية تتفعّل/تتلغى لكل مستخدم. القيمة الافتراضية لكل
+// حساب جديد = نفس الوضع الحالي (يشوف كل شي) - حتى ما ينكسر شي لحدا موجود أصلاً؛
+// الأدمن بعدين يقدر يضيّق صلاحيات مستخدمين معينين لو حاب من تبويب "المستخدمين".
+const PERMISSION_KEYS = ['dashboard', 'quotation', 'procurement', 'contracts', 'pmp', 'backup', 'files', 'teamSync', 'manageUsers'];
+const DEFAULT_PERMISSIONS = {
+  dashboard: true,
+  quotation: true,
+  procurement: true,
+  contracts: true,
+  pmp: true,
+  backup: true,
+  files: true,
+  teamSync: true,
+  manageUsers: false,
+};
+const ALL_PERMISSIONS_TRUE = PERMISSION_KEYS.reduce((acc, k) => { acc[k] = true; return acc; }, {});
+function sanitizePermissions(input, base) {
+  const result = Object.assign({}, base || DEFAULT_PERMISSIONS);
+  if (input && typeof input === 'object') {
+    PERMISSION_KEYS.forEach((k) => {
+      if (typeof input[k] === 'boolean') result[k] = input[k];
+    });
+  }
+  return result;
+}
+function publicUser(key, u) {
+  return {
+    username: u.username || key,
+    isAdmin: !!u.isAdmin,
+    permissions: sanitizePermissions(u.permissions),
+    deviceName: u.deviceName || '',
+    createdAt: u.createdAt || null,
+  };
+}
+
+// بيتحقق إذا الطلب جاي من الأدمن - إما عن طريق رابط المالك (#owner=ADMIN_TOKEN، نفس
+// طريقة نظام موافقة الأجهزة تمامًا)، أو عن طريق حساب مستخدم عادي متعلّم isAdmin:true.
+function resolveAdmin(req) {
+  const adminToken = (req.body && req.body.adminToken) || req.query.adminToken;
+  if (adminToken && ADMIN_TOKEN && adminToken === ADMIN_TOKEN) {
+    return { isOwner: true, username: null };
+  }
+  // جهاز المالك المعتمد (isOwner:true بنظام موافقة الواتساب) - هيك تبويب "المستخدمين" بالداشبورد
+  // بيقدر يستخدم مسارات الإدارة بدون ما يحتاج يحمل ADMIN_TOKEN الخام أو ينشئ حساب يوزرنيم/باسوورد.
+  const deviceToken = (req.body && req.body.deviceToken) || req.query.deviceToken;
+  if (deviceToken) {
+    const devices = loadDevices();
+    const d = devices[deviceToken];
+    if (d && d.isOwner && d.status === 'approved') {
+      return { isOwner: true, username: null };
+    }
+  }
+  const token = (req.body && req.body.token) || req.query.token;
+  if (token) {
+    const sessions = loadSessions();
+    const s = sessions[token];
+    if (s) {
+      const users = loadUsers();
+      const u = users[s.username];
+      // إما isAdmin (صلاحيات شاملة) أو صلاحية "إدارة المستخدمين" لحالها (تبويب المستخدمين
+      // بس، بدون بالضرورة باقي صلاحيات الأدمن الكاملة) - الاثنين بيسمحوا بمسارات إدارة الحسابات.
+      if (u && (u.isAdmin || (u.permissions && u.permissions.manageUsers))) {
+        return { isOwner: false, username: s.username };
+      }
+    }
+  }
+  return null;
+}
+
+// هل هالجهاز (يلي أصلاً approved بنظام الواتساب) عملّو حد حساب يوزرنيم/باسوورد ولا لسا؟
+// الأداة (Dashboard/index/procurement) بتسأل هالسؤال أول ما تعدي بوابة موافقة الواتساب،
+// وبتقرر تبعو تعرض "أنشئ حساب" أو "سجّل دخول" أو تفوّت مباشرة لو في جلسة محفوظة صالحة.
+app.get('/users/status', (req, res) => {
+  const deviceToken = (req.query.deviceToken || '').toString();
+  const devices = loadDevices();
+  const deviceEntry = devices[deviceToken];
+  if (!deviceEntry || deviceEntry.status !== 'approved') {
+    return res.status(403).json({ error: 'device not approved' });
+  }
+  // جهاز المالك (دخل مرة عن طريق رابط #owner=) ما بيحتاج ينشئ حساب يوزرنيم/باسوورد أبدًا -
+  // نفس الامتياز يلي كان عندو دايمًا. الأداة (الملفات الثلاثة) بتتحقق من هالحقل وبتفوّت مباشرة.
+  if (deviceEntry.isOwner) {
+    return res.json({ isOwnerDevice: true, hasAccount: true });
+  }
+  const users = loadUsers();
+  const found = Object.entries(users).find(([, u]) => u.deviceToken === deviceToken);
+  if (!found) return res.json({ hasAccount: false });
+  res.json({ hasAccount: true, username: found[1].username || found[0] });
+});
+
+app.post('/users/register', (req, res) => {
+  try {
+    const { deviceToken, username, password } = req.body || {};
+    const devices = loadDevices();
+    const deviceEntry = devices[deviceToken];
+    if (!deviceEntry || deviceEntry.status !== 'approved') {
+      return res.status(403).json({ error: 'device not approved' });
+    }
+    const key = normalizeUsername(username);
+    if (!key || key.length < 2 || key.length > 30) {
+      return res.status(400).json({ error: 'اسم مستخدم غير صالح (لازم يكون بين 2 و30 حرف)' });
+    }
+    if (!password || String(password).length < 6) {
+      return res.status(400).json({ error: 'كلمة المرور لازم تكون 6 أحرف على الأقل' });
+    }
+    const users = loadUsers();
+    if (users[key]) {
+      return res.status(409).json({ error: 'اسم المستخدم هاد مستخدم من حدا تاني - اختار اسم مختلف' });
+    }
+    const existingForDevice = Object.entries(users).find(([, u]) => u.deviceToken === deviceToken);
+    if (existingForDevice) {
+      return res.status(409).json({ error: 'هالجهاز عنده حساب مسجّل مسبقًا - جرب تسجيل الدخول بدل إنشاء حساب جديد' });
+    }
+    users[key] = {
+      username: String(username).trim(),
+      passwordHash: hashPassword(password),
+      permissions: Object.assign({}, DEFAULT_PERMISSIONS),
+      isAdmin: false,
+      deviceToken,
+      deviceName: deviceEntry.name || '',
+      createdAt: Date.now(),
+    };
+    saveUsers(users);
+    const token = newSessionToken();
+    const sessions = loadSessions();
+    sessions[token] = { username: key, createdAt: Date.now() };
+    saveSessions(sessions);
+    res.json({ token, username: users[key].username, isAdmin: false, permissions: users[key].permissions });
+  } catch (e) {
+    console.error('[Users] /users/register failed:', e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.post('/users/login', (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    const key = normalizeUsername(username);
+    const users = loadUsers();
+    const u = users[key];
+    if (!u || !u.passwordHash || !verifyPassword(password, u.passwordHash)) {
+      return res.status(401).json({ error: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
+    }
+    const token = newSessionToken();
+    const sessions = loadSessions();
+    sessions[token] = { username: key, createdAt: Date.now() };
+    saveSessions(sessions);
+    res.json({ token, username: u.username, isAdmin: !!u.isAdmin, permissions: sanitizePermissions(u.permissions) });
+  } catch (e) {
+    console.error('[Users] /users/login failed:', e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get('/users/me', (req, res) => {
+  const token = (req.query.token || '').toString();
+  const sessions = loadSessions();
+  const s = sessions[token];
+  if (!s) return res.status(401).json({ error: 'invalid session' });
+  const users = loadUsers();
+  const u = users[s.username];
+  if (!u) return res.status(401).json({ error: 'invalid session' });
+  res.json({ username: u.username, isAdmin: !!u.isAdmin, permissions: sanitizePermissions(u.permissions) });
+});
+
+app.post('/users/logout', (req, res) => {
+  const { token } = req.body || {};
+  if (token) {
+    const sessions = loadSessions();
+    delete sessions[token];
+    saveSessions(sessions);
+  }
+  res.json({ ok: true });
+});
+
+// من هون لتحت: مسارات إدارية بس (تبويب "المستخدمين" بالداشبورد) - لازم إما رابط
+// المالك (#owner=ADMIN_TOKEN) أو حساب مستخدم isAdmin:true.
+app.get('/users/list', (req, res) => {
+  const admin = resolveAdmin(req);
+  if (!admin) return res.status(401).json({ error: 'unauthorized' });
+  const users = loadUsers();
+  const ownerRow = {
+    username: 'المالك (Admin)',
+    isAdmin: true,
+    isOwner: true,
+    permissions: Object.assign({}, ALL_PERMISSIONS_TRUE),
+    deviceName: '-',
+    createdAt: null,
+  };
+  const list = Object.entries(users)
+    .sort((a, b) => (a[1].createdAt || 0) - (b[1].createdAt || 0))
+    .map(([key, u]) => Object.assign({ key }, publicUser(key, u)));
+  res.json({ users: [ownerRow, ...list] });
+});
+
+app.post('/users/permissions', (req, res) => {
+  const admin = resolveAdmin(req);
+  if (!admin) return res.status(401).json({ error: 'unauthorized' });
+  const { username, permissions, isAdmin } = req.body || {};
+  const key = normalizeUsername(username);
+  const users = loadUsers();
+  const u = users[key];
+  if (!u) return res.status(404).json({ error: 'user not found' });
+  u.permissions = sanitizePermissions(permissions, u.permissions);
+  if (typeof isAdmin === 'boolean') u.isAdmin = isAdmin;
+  users[key] = u;
+  saveUsers(users);
+  res.json({ ok: true, user: publicUser(key, u) });
+});
+
+app.post('/users/reset-password', (req, res) => {
+  const admin = resolveAdmin(req);
+  if (!admin) return res.status(401).json({ error: 'unauthorized' });
+  const { username } = req.body || {};
+  const key = normalizeUsername(username);
+  const users = loadUsers();
+  const u = users[key];
+  if (!u) return res.status(404).json({ error: 'user not found' });
+  delete u.passwordHash;
+  users[key] = u;
+  saveUsers(users);
+  const sessions = loadSessions();
+  Object.keys(sessions).forEach((t) => {
+    if (sessions[t].username === key) delete sessions[t];
+  });
+  saveSessions(sessions);
+  res.json({ ok: true });
+});
+
+app.post('/users/delete', (req, res) => {
+  const admin = resolveAdmin(req);
+  if (!admin) return res.status(401).json({ error: 'unauthorized' });
+  const { username } = req.body || {};
+  const key = normalizeUsername(username);
+  const users = loadUsers();
+  if (!users[key]) return res.status(404).json({ error: 'user not found' });
+  delete users[key];
+  saveUsers(users);
+  const sessions = loadSessions();
+  Object.keys(sessions).forEach((t) => {
+    if (sessions[t].username === key) delete sessions[t];
+  });
+  saveSessions(sessions);
+  res.json({ ok: true });
 });
 
 app.listen(PORT, () => console.log(`[Server] Running on port ${PORT}`));
