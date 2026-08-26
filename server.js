@@ -1209,9 +1209,15 @@ function normalizeUsername(u) {
 // شو الأقسام/الأدوات يلي فيها صلاحية تتفعّل/تتلغى لكل مستخدم. القيمة الافتراضية لكل
 // حساب جديد = نفس الوضع الحالي (يشوف كل شي) - حتى ما ينكسر شي لحدا موجود أصلاً؛
 // الأدمن بعدين يقدر يضيّق صلاحيات مستخدمين معينين لو حاب من تبويب "المستخدمين".
-const PERMISSION_KEYS = ['dashboard', 'quotation', 'procurement', 'contracts', 'pmp', 'backup', 'files', 'teamSync', 'manageUsers'];
+// 🆕 2026-08-26: ضفنا 'dashboardHome' - صلاحية مستقلة عن 'dashboard' (يلي هي بوابة الدخول لملف
+// Dashboard.html كامل، لسا موجودة وما تغيّرت). 'dashboardHome' بتتحكم تحديدًا بشاشة "اللوحة
+// الرئيسية" (الإحصائيات المالية، الرسم البياني، سجل العروض) لأنها فيها معلومات حساسة - مستخدم
+// ممكن يكون مسموحلو يدخل Dashboard.html ويستخدم تبويب معيّن (متل المشتريات) بدون ما يشوف
+// الشاشة الرئيسية الحساسة.
+const PERMISSION_KEYS = ['dashboard', 'dashboardHome', 'quotation', 'procurement', 'contracts', 'pmp', 'backup', 'files', 'teamSync', 'manageUsers'];
 const DEFAULT_PERMISSIONS = {
   dashboard: true,
+  dashboardHome: true,
   quotation: true,
   procurement: true,
   contracts: true,
