@@ -104,58 +104,51 @@ app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN }));
 
 let lastQr = null;
 let clientReady = false;
+let client = null;
 
-const client = new Client({
-  authStrategy: new LocalAuth({ dataPath: AUTH_DATA_PATH }),
-  puppeteer: {
-    headless: true,
-    // When deployed via the included Dockerfile, PUPPETEER_EXECUTABLE_PATH points at the
-    // system Chromium installed there (apt-get) instead of Puppeteer's own bundled download -
-    // the bundled one is missing several native libraries on minimal Linux hosts like Railway's
-    // default image, which crashes with "error while loading shared libraries: libglib-2.0...".
-    // Falls back to the bundled Chromium (undefined = default) when this isn't set, e.g. locally.
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-  },
-  // 🔧 2026-08-26: شلنا تثبيت نسخة WhatsApp Web على ملف محدد بمستودع خارجي (كان هون قبل).
-  // السبب: هيك مصادر (raw.githubusercontent.com/wppconnect-team/wa-version) بتشيل/بتغيّر أسماء
-  // الملفات القديمة بشكل دوري - ولما الملف المثبّت عليه يختفي أو يصير فيه مشكلة بالجلب، الـ
-  // client.initialize() بيعلق (hang) بصمت: ما بيطلع QR، ما بيصير ready، وما بيطبع ولا خطأ - بالضبط
-  // نفس العرض يلي شفناه (health دايمًا false و/qr دايمًا "still starting up"). رجّعنا الإعداد
-  // الافتراضي (type: 'local') يلي بياخد نسخة WhatsApp Web مباشرة من نفس الصفحة وقت تحميلها،
-  // بدون اعتماد على أي ملف خارجي ثابت ممكن يختفي أو يتغيّر اسمه.
-  webVersionCache: {
-    type: 'local',
-  },
-});
+// 🆕 2026-08-27: إصلاح جذري (طلب حمدي: "بدي لاقي حل جذري لما اعمل ابديت ما يصير هي المشكلة مرة
+// تانية") - قبل هيك كانت شبكة الأمان (الـ60 ثانية تحت) بس بتسجّل تحذير بالـlogs وبتوقف، والسيرفر
+// كان بيضل عالق (whatsappReady:false للأبد) لحتى حدا يلاحظ ويتدخل يدويًا - وهيك ضلت مشكلة طلحة
+// (رسالة واتساب ما وصلت) عالقة أكتر من يوم كامل من غير ما حدا يعرف. هلق الإصلاح فعلي وتلقائي:
+// لو خلصت 60 ثانية من initialize() وما صار ready وما طلع QR (دليل قوي إنو الجلسة المحفوظة على
+// الـVolume تالفة أو عالقة بالتحميل)، السيرفر بنفسه: (1) يمسح مجلد الجلسة بالكامل، (2) يعيد
+// initialize() من جديد بجلسة نظيفة تمامًا - فبيطلع QR جديد للمسح خلال حوالي دقيقة، بدل ما يضل
+// عالق للأبد. حددنا حد أقصى محاولتين تلقائيتين (MAX_AUTO_HEAL_ATTEMPTS) حتى ما يصير حلقة محو-
+// وإعادة-محاولة لانهائية لو كانت المشكلة شي تاني غير الجلسة (مشكلة شبكة أو كروميوم مثلاً) - لو
+// استمرت المشكلة بعدهم منوقف ومنسجل تحذير واضح يحتاج مراجعة يدوية بدل ما نستمر نحاول للأبد.
+// كمان لو انفصل الاتصال لأي سبب بعد ما كان شغال (حدث 'disconnected')، منعيد المحاولة تلقائيًا
+// فورًا (أول مرة من غير ما نمسح الجلسة - ممكن يرجع يتصل بنفس الجلسة القديمة بدون حاجة لمسح QR
+// جديد؛ لو هاي المحاولة نفسها علّقت 60 ثانية كمان، شبكة الأمان فوق بتاخد القرار وتمسح وتعيد).
+let whatsappInitAttempts = 0;
+const MAX_AUTO_HEAL_ATTEMPTS = 2;
+let whatsappCycleId = 0;
+let cycleResolvedFlag = false;
 
-// شبكة أمان: إذا خلص 60 ثانية من بعد initialize() وما صار ready ولا طلع QR، هاد دليل قوي إنو
-// في تعليق (hang) بمكان ما (شبكة، تحميل صفحة واتساب، أو مشكلة بالجلسة المحفوظة) - نطبع تحذير
-// واضح بالـlogs بدل ما يضل السيرفر ساكت وما حدا يعرف ليش.
-setTimeout(() => {
-  if (!clientReady && !lastQr) {
-    console.warn('[WhatsApp] ⚠️ مرت 60 ثانية وما صار ready وما طلع QR - غالبًا في تعليق (hang) بتحميل واتساب ويب أو بالجلسة المحفوظة. جرب تمسح مجلد الجلسة (' + AUTH_DATA_PATH + ') من الـVolume وأعد النشر لتبلش جلسة نظيفة.');
-  }
-}, 60000);
-
-client.on('qr', (qr) => {
-  lastQr = qr;
-  clientReady = false;
-  console.log('[WhatsApp] A new QR code is ready - open /qr in your browser to scan it with your WhatsApp number.');
-});
-client.on('ready', () => {
-  clientReady = true;
-  lastQr = null;
-  console.log('[WhatsApp] Login successful ✅ - the server is ready to send messages.');
-});
-client.on('auth_failure', (msg) => {
-  clientReady = false;
-  console.error('[WhatsApp] Login failed:', msg);
-});
-client.on('disconnected', (reason) => {
-  clientReady = false;
-  console.warn('[WhatsApp] Disconnected:', reason);
-});
+function buildWhatsAppClient() {
+  return new Client({
+    authStrategy: new LocalAuth({ dataPath: AUTH_DATA_PATH }),
+    puppeteer: {
+      headless: true,
+      // When deployed via the included Dockerfile, PUPPETEER_EXECUTABLE_PATH points at the
+      // system Chromium installed there (apt-get) instead of Puppeteer's own bundled download -
+      // the bundled one is missing several native libraries on minimal Linux hosts like Railway's
+      // default image, which crashes with "error while loading shared libraries: libglib-2.0...".
+      // Falls back to the bundled Chromium (undefined = default) when this isn't set, e.g. locally.
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    },
+    // 🔧 2026-08-26: شلنا تثبيت نسخة WhatsApp Web على ملف محدد بمستودع خارجي (كان هون قبل).
+    // السبب: هيك مصادر (raw.githubusercontent.com/wppconnect-team/wa-version) بتشيل/بتغيّر أسماء
+    // الملفات القديمة بشكل دوري - ولما الملف المثبّت عليه يختفي أو يصير فيه مشكلة بالجلب، الـ
+    // client.initialize() بيعلق (hang) بصمت: ما بيطلع QR، ما بيصير ready، وما بيطبع ولا خطأ - بالضبط
+    // نفس العرض يلي شفناه (health دايمًا false و/qr دايمًا "still starting up"). رجّعنا الإعداد
+    // الافتراضي (type: 'local') يلي بياخد نسخة WhatsApp Web مباشرة من نفس الصفحة وقت تحميلها،
+    // بدون اعتماد على أي ملف خارجي ثابت ممكن يختفي أو يتغيّر اسمه.
+    webVersionCache: {
+      type: 'local',
+    },
+  });
+}
 
 // Fallback way to find a group's ID that doesn't rely on client.getChats() - on some
 // WhatsApp Web builds that call fails with an opaque internal error (e.g. "r: r") even
@@ -163,19 +156,84 @@ client.on('disconnected', (reason) => {
 // that already arrives with each message event, no extra internal calls needed. See the
 // /last-messages route below - send a test message in the group, then open that route.
 const recentMessages = [];
-client.on('message_create', (msg) => {
+
+function wireClientEvents(c) {
+  c.on('qr', (qr) => {
+    lastQr = qr;
+    clientReady = false;
+    cycleResolvedFlag = true;
+    console.log('[WhatsApp] A new QR code is ready - open /qr in your browser to scan it with your WhatsApp number.');
+  });
+  c.on('ready', () => {
+    clientReady = true;
+    lastQr = null;
+    cycleResolvedFlag = true;
+    whatsappInitAttempts = 0; // نجح الاتصال - أي تعليق لاحق مستقبلاً بيتعامل معه من الصفر كمشكلة جديدة
+    console.log('[WhatsApp] Login successful ✅ - the server is ready to send messages.');
+  });
+  c.on('auth_failure', (msg) => {
+    clientReady = false;
+    console.error('[WhatsApp] Login failed:', msg);
+  });
+  c.on('disconnected', (reason) => {
+    clientReady = false;
+    console.warn('[WhatsApp] Disconnected:', reason, '- عم نعيد تشغيل الاتصال تلقائيًا...');
+    startWhatsAppClient();
+  });
+  c.on('message_create', (msg) => {
+    try {
+      recentMessages.unshift({
+        from: msg.from,
+        fromMe: !!msg.fromMe,
+        body: (msg.body || '').toString().slice(0, 80),
+        at: Date.now(),
+      });
+      if (recentMessages.length > 20) recentMessages.length = 20;
+    } catch (e) {
+      console.error('[Debug] Failed to record message:', e);
+    }
+  });
+}
+
+function wipeWhatsAppAuthSession() {
   try {
-    recentMessages.unshift({
-      from: msg.from,
-      fromMe: !!msg.fromMe,
-      body: (msg.body || '').toString().slice(0, 80),
-      at: Date.now(),
-    });
-    if (recentMessages.length > 20) recentMessages.length = 20;
+    fs.rmSync(AUTH_DATA_PATH, { recursive: true, force: true });
+    console.log('[WhatsApp] 🗑️ تم حذف مجلد جلسة الواتساب المحفوظة بالكامل (' + AUTH_DATA_PATH + ') - رح تبلش جلسة نظيفة من الصفر (لازم مسح QR جديد من /qr بعد شوي).');
   } catch (e) {
-    console.error('[Debug] Failed to record message:', e);
+    console.error('[WhatsApp] تعذّر حذف مجلد الجلسة:', e);
   }
-});
+}
+
+function startWhatsAppClient() {
+  const myCycle = ++whatsappCycleId;
+  cycleResolvedFlag = false;
+  cleanupStaleChromeLocks(AUTH_DATA_PATH);
+  client = buildWhatsAppClient();
+  wireClientEvents(client);
+  console.log('[WhatsApp] بدأنا initialize() - عم نحاول نفتح كروميوم ونحمّل واتساب ويب...');
+  client.initialize().catch((e) => {
+    console.error('[WhatsApp] initialize() فشلت:', e);
+  });
+
+  // شبكة الأمان: إذا خلص 60 ثانية وما صار ready ولا طلع QR بهالدورة تحديدًا (myCycle) - دليل قوي
+  // إنو في تعليق (hang) بالجلسة المحفوظة. منمسحها ومنعيد المحاولة تلقائيًا، لحد MAX_AUTO_HEAL_ATTEMPTS.
+  setTimeout(() => {
+    if (myCycle !== whatsappCycleId) return; // صار في دورة أحدث (مثلاً بسبب disconnected) - هالمؤقّت صار قديم، تجاهله
+    if (!cycleResolvedFlag) {
+      whatsappInitAttempts++;
+      if (whatsappInitAttempts <= MAX_AUTO_HEAL_ATTEMPTS) {
+        console.warn('[WhatsApp] ⚠️ مرت 60 ثانية وما صار ready وما طلع QR (محاولة إصلاح تلقائي ' + whatsappInitAttempts + '/' + MAX_AUTO_HEAL_ATTEMPTS + ') - غالبًا الجلسة المحفوظة تالفة أو عالقة بالتحميل. عم نمسحها ونعيد المحاولة بجلسة نظيفة...');
+        try { client.destroy().catch(() => {}); } catch (e) {}
+        wipeWhatsAppAuthSession();
+        startWhatsAppClient();
+      } else {
+        console.error('[WhatsApp] ❌ استمرت المشكلة بعد ' + MAX_AUTO_HEAL_ATTEMPTS + ' محاولات إصلاح تلقائي - المشكلة أعمق من مجرد جلسة تالفة (شبكة/كروميوم مثلاً). لازم مراجعة يدوية للـDeploy Logs.');
+      }
+    }
+  }, 60000);
+}
+
+startWhatsAppClient();
 
 // Chrome writes lock files (SingletonLock etc.) into its profile folder while running, and
 // removes them on a clean exit. If the container gets killed mid-crash (exactly what happens
@@ -209,12 +267,6 @@ function cleanupStaleChromeLocks(rootDir) {
   }
   walk(rootDir);
 }
-cleanupStaleChromeLocks(AUTH_DATA_PATH);
-
-console.log('[WhatsApp] بدأنا initialize() - عم نحاول نفتح كروميوم ونحمّل واتساب ويب...');
-client.initialize().catch((e) => {
-  console.error('[WhatsApp] initialize() فشلت:', e);
-});
 
 function checkAuth(req, res, next) {
   const token = req.headers['x-api-key'] || req.query.token;
