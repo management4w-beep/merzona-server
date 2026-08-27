@@ -637,18 +637,22 @@ async function driveFindPdfCaseInsensitive(ref, parentId, token) {
   });
   const data = await res.json();
   const files = (data.files || []);
-  const wantedLower = (ref + '.pdf').toLowerCase();
-  const match = files.find((f) => String(f.name || '').toLowerCase() === wantedLower) || null;
-  // 🔧 تشخيص مؤقت (طلب حمدي - عرض السعر بيقول "quotation pdf missing" رغم إنو الملف ظاهر بجوجل
-  // درايف يدويًا) - منسجّل بالظبط شو رجعلنا API جوجل درايف (حالة الطلب، وكل أسماء الملفات يلي
-  // لقاها بنفس المجلد بالضبط بالـJSON، حتى لو فيه فرق أحرف مخفي ما منشوفه بالعين المجردة) - هيك
-  // نقدر نلاقي السبب الحقيقي من Deploy Logs براحواي بدل التخمين. لازم تنشال هاي الأسطر بعد ما تنحل
-  // المشكلة نهائيًا.
-  console.log('[PDF لوغ تشخيصي] ref=' + JSON.stringify(ref) + ' parentId=' + parentId + ' driveApiOk=' + res.ok + ' driveApiStatus=' + res.status);
-  console.log('[PDF لوغ تشخيصي] بدنا نلاقي (lowercase)=' + JSON.stringify(wantedLower));
-  console.log('[PDF لوغ تشخيصي] كل الملفات يلي جوجل درايف رجعهملنا بنفس المجلد:', JSON.stringify(files.map(f => ({ name: f.name, mimeType: f.mimeType }))));
-  if (data.error) console.error('[PDF لوغ تشخيصي] خطأ من جوجل درايف API:', JSON.stringify(data.error));
-  console.log('[PDF لوغ تشخيصي] النتيجة: ' + (match ? ('لقينا تطابق - ' + match.name) : 'ما في تطابق'));
+  const refLower = ref.toLowerCase();
+  const wantedExact = refLower + '.pdf';
+  // أولوية لتطابق تام (بغض النظر عن حالة الأحرف) - "M-Q-260212.pdf" أو حتى "m-q-260212.PDF".
+  let match = files.find((f) => String(f.name || '').toLowerCase() === wantedExact) || null;
+  if (!match) {
+    // 🆕 2026-08-27 (طلب حمدي، فحص فعلي بالـLogs) - بعض ملفات الـPDF القديمة/المرفوعة يدويًا صار
+    // معها امتداد مكرر بالغلط (مثلاً "M-Q-260212.PDF.pdf" - جوجل درايف بيخبي آخر امتداد بالعرض
+    // العادي، فبيبين "M-Q-260212.PDF" بس بالحقيقة الاسم المخزّن فيه ".pdf" زيادة بالآخر) - فما كان
+    // في تطابق تام حتى بعد تجاهل حالة الأحرف. هون منتساهل: أي ملف بنفس المجلد اسمه يبلش بنفس الرقم
+    // المرجعي (بغض النظر عن حالة الأحرف) وينتهي فعليًا بـ.pdf منقبله - بما إنو البحث محصور أصلًا
+    // بمجلد هالعرض بس، ما في خطر نلاقي ملف غلط تابع لعرض تاني.
+    match = files.find((f) => {
+      const nameLower = String(f.name || '').toLowerCase();
+      return nameLower.startsWith(refLower) && nameLower.endsWith('.pdf');
+    }) || null;
+  }
   return match;
 }
 async function driveFindOrCreateFolder(name, parentId, token) {
