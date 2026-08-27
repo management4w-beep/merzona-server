@@ -396,7 +396,9 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
       // since that's the language of the "Tasks" group / the team reading it.
       // Only this file's comments and API responses were translated to English.
       let msg = '📋 *عرض سعر جديد - Merzona*\n';
-      if (ref) msg += `المرجع: ${ref}\n`;
+      // 🆕 2026-08-27: لف رقم المرجع بعلامات LTR isolate (⁦...⁩) عشان ما ينعكس ترتيبه
+      // بصفحات/تطبيقات تعرض النص بالاتجاه الثنائي (bidi) - نفس النمط المستخدم بمكان تاني بالمشروع.
+      if (ref) msg += `المرجع: ⁦${ref}⁩\n`;
       if (clientName) msg += `العميل: ${clientName}\n`;
       if (location) msg += `الإمارة: ${location}\n`;
       if (mobile) msg += `الموبايل: ${mobile}\n`;
@@ -888,7 +890,8 @@ async function sendSignedContractToWhatsApp({ ref, clientName, total, signerName
   if (!clientReady) throw new Error('whatsapp-not-ready');
   if (!CONTRACTS_GROUP_ID) throw new Error('CONTRACTS_GROUP_ID not set on the server - see README.md');
   let msg = '✅ *عقد جديد موقّع إلكترونيًا - Merzona*\n';
-  msg += `المرجع: ${ref}\n`;
+  // 🆕 2026-08-27: نفس إصلاح bidi المطبّق بمسار /send-quotation
+  msg += `المرجع: ⁦${ref}⁩\n`;
   if (clientName) msg += `العميل: ${clientName}\n`;
   if (total) msg += `القيمة الإجمالية: ${fmtNumServer(total)} AED\n`;
   msg += `الموقّع: ${signerName}\n`;
