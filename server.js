@@ -624,6 +624,22 @@ async function driveFindItemInParent(name, parentId, token) {
   const data = await res.json();
   return (data.files && data.files[0]) || null;
 }
+// 🆕 2026-08-27 (طلب حمدي) - جوجل درايف بيعتبر البحث بالاسم بالضبط (name = 'X') حساس لحالة الأحرف
+// (case-sensitive) - واكتشفنا إنو بعض عروض الأسعار (قديمة، أو اترفعت يدويًا) ملف الـPDF متاعها
+// محفوظ بامتداد أحرف كبيرة (.PDF) بدل الصغيرة المعتادة (.pdf) يلي كودنا بيولّدها تلقائيًا، فبحث
+// driveFindItemInParent العادي (المطابقة الحرفية بالضبط) ما كان عم يلاقيه وكان راجع "quotation pdf
+// missing" غلط رغم إنو الملف موجود فعليًا. هالدالة بتسرد كل الملفات جوا نفس المجلد وبتقارن الاسم
+// case-insensitive، حتى تشتغل معاينة عرض السعر بكل الحالات (صغير/كبير الحروف).
+async function driveFindPdfCaseInsensitive(ref, parentId, token) {
+  const q = encodeURIComponent(`'${parentId}' in parents and trashed = false`);
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name,mimeType)`, {
+    headers: { Authorization: 'Bearer ' + token },
+  });
+  const data = await res.json();
+  const files = (data.files || []);
+  const wantedLower = (ref + '.pdf').toLowerCase();
+  return files.find((f) => String(f.name || '').toLowerCase() === wantedLower) || null;
+}
 async function driveFindOrCreateFolder(name, parentId, token) {
   const existing = await driveFindItemInParent(name, parentId, token);
   if (existing) return existing.id;
@@ -940,7 +956,7 @@ app.post('/sign/:ref', async (req, res) => {
       return res.json({ ok: true, alreadySigned: true, downloadUrl: `/sign/${encodeURIComponent(ref)}/pdf?t=${encodeURIComponent(token)}` });
     }
 
-    const originalPdfItem = await driveFindItemInParent(ref + '.pdf', refFolderId, driveToken);
+    const originalPdfItem = await driveFindPdfCaseInsensitive(ref, refFolderId, driveToken);
     if (!originalPdfItem) return res.status(500).json({ error: 'quotation-pdf-missing' });
     const originalPdfBuffer = await driveDownloadBuffer(originalPdfItem.id, driveToken);
 
@@ -1045,7 +1061,7 @@ app.get('/sign/:ref/preview-pdf', async (req, res) => {
     if (!found) return res.status(404).send('not found');
     const { data, refFolderId } = found;
     if (!data.signToken || data.signToken !== token) return res.status(401).send('unauthorized');
-    const originalPdfItem = await driveFindItemInParent(ref + '.pdf', refFolderId, driveToken);
+    const originalPdfItem = await driveFindPdfCaseInsensitive(ref, refFolderId, driveToken);
     if (!originalPdfItem) return res.status(404).send('quotation pdf missing');
     const pdfBuffer = await driveDownloadBuffer(originalPdfItem.id, driveToken);
     res.setHeader('Content-Type', 'application/pdf');
