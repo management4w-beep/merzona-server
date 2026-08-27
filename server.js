@@ -1027,6 +1027,36 @@ app.get('/sign/:ref/pdf', async (req, res) => {
   }
 });
 
+// 🆕 2026-08-27 (طلب حمدي) - معاينة عرض السعر *الأصلي* (قبل التوقيع) - نفس ملف الـPDF المخزّن أصلاً
+// بجوجل درايف (نفس الملف يلي منستخدمه وقت التوقيع الفعلي فوق لدمج التوقيع فوقه) - هون بس منرجعه
+// للمتصفح (inline) حتى صفحة sign.html تقدر تعرضه كصور يقلب فيها الزبون صفحة صفحة قبل ما يوقّع،
+// ويتأكد إنو مطابق لنفس العرض يلي انبعتله قبل هيك عالواتساب. ما في أي تعديل على الملف نفسه هون -
+// بس قراءة/عرض.
+app.get('/sign/:ref/preview-pdf', async (req, res) => {
+  const ref = String(req.params.ref || '').trim();
+  const token = String(req.query.t || '');
+  if (!REF_PATTERN.test(ref)) return res.status(400).send('bad ref');
+  if (!token) return res.status(400).send('missing token');
+  if (isSignViewRateLimited()) return res.status(429).send('rate limit');
+  signViewLog.push(Date.now());
+  try {
+    const driveToken = await getServerDriveAccessToken();
+    const found = await loadQuotationDataFile(ref, driveToken);
+    if (!found) return res.status(404).send('not found');
+    const { data, refFolderId } = found;
+    if (!data.signToken || data.signToken !== token) return res.status(401).send('unauthorized');
+    const originalPdfItem = await driveFindItemInParent(ref + '.pdf', refFolderId, driveToken);
+    if (!originalPdfItem) return res.status(404).send('quotation pdf missing');
+    const pdfBuffer = await driveDownloadBuffer(originalPdfItem.id, driveToken);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${ref}.pdf"`);
+    res.send(pdfBuffer);
+  } catch (e) {
+    console.error('[Sign] GET /sign/:ref/preview-pdf failed:', e);
+    res.status(500).send('server error');
+  }
+});
+
 // ============================================================================
 //  Login-approval system
 //  Every new browser/device that opens the Merzona tool is locked out until
