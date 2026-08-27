@@ -638,7 +638,18 @@ async function driveFindPdfCaseInsensitive(ref, parentId, token) {
   const data = await res.json();
   const files = (data.files || []);
   const wantedLower = (ref + '.pdf').toLowerCase();
-  return files.find((f) => String(f.name || '').toLowerCase() === wantedLower) || null;
+  const match = files.find((f) => String(f.name || '').toLowerCase() === wantedLower) || null;
+  // 🔧 تشخيص مؤقت (طلب حمدي - عرض السعر بيقول "quotation pdf missing" رغم إنو الملف ظاهر بجوجل
+  // درايف يدويًا) - منسجّل بالظبط شو رجعلنا API جوجل درايف (حالة الطلب، وكل أسماء الملفات يلي
+  // لقاها بنفس المجلد بالضبط بالـJSON، حتى لو فيه فرق أحرف مخفي ما منشوفه بالعين المجردة) - هيك
+  // نقدر نلاقي السبب الحقيقي من Deploy Logs براحواي بدل التخمين. لازم تنشال هاي الأسطر بعد ما تنحل
+  // المشكلة نهائيًا.
+  console.log('[PDF لوغ تشخيصي] ref=' + JSON.stringify(ref) + ' parentId=' + parentId + ' driveApiOk=' + res.ok + ' driveApiStatus=' + res.status);
+  console.log('[PDF لوغ تشخيصي] بدنا نلاقي (lowercase)=' + JSON.stringify(wantedLower));
+  console.log('[PDF لوغ تشخيصي] كل الملفات يلي جوجل درايف رجعهملنا بنفس المجلد:', JSON.stringify(files.map(f => ({ name: f.name, mimeType: f.mimeType }))));
+  if (data.error) console.error('[PDF لوغ تشخيصي] خطأ من جوجل درايف API:', JSON.stringify(data.error));
+  console.log('[PDF لوغ تشخيصي] النتيجة: ' + (match ? ('لقينا تطابق - ' + match.name) : 'ما في تطابق'));
+  return match;
 }
 async function driveFindOrCreateFolder(name, parentId, token) {
   const existing = await driveFindItemInParent(name, parentId, token);
