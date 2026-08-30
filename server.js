@@ -686,7 +686,16 @@ async function driveUploadBuffer(filename, mimeType, buffer, parentId, token) {
     headers: { Authorization: 'Bearer ' + token },
     body: form,
   });
-  return res.json();
+  const json = await res.json();
+  // 🔧 2026-08-30 (تصليح باغ "توقيع الكتروني بيظهر ناجح بس الملف ما بيوصل جوجل درايف إطلاقًا"،
+  // اكتشفناه مع عقد الزبون M-Q-260212): قبل هيك كنا نرجّع res.json() مباشرة بدون ما نتأكد إنه
+  // الرفع نجح فعليًا - لو Google Drive رجّعت خطأ (مثلاً توكن منتهي الصلاحية أو مشكلة مؤقتة)، كانت
+  // بترجع JSON فيه {error:...} مش {id:...}، وهاد كان يمر بصمت وكأنه نجح. هلق منتأكد إنه في id حقيقي
+  // قبل ما نعتبر الرفع ناجح، وإلا منطلع خطأ واضح بدل ما نكمل وكأنه كل شي تمام.
+  if (!res.ok || !json || !json.id) {
+    throw new Error('drive-upload-failed: ' + JSON.stringify(json && json.error ? json.error : json));
+  }
+  return json;
 }
 async function driveUpdateFileContent(fileId, mimeType, buffer, token) {
   const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
@@ -969,7 +978,12 @@ app.post('/sign/:ref', async (req, res) => {
     const { data, fileId, refFolderId } = found;
     if (!data.signToken || data.signToken !== token) return res.status(401).json({ error: 'invalid-token' });
 
-    if (data.signedAt) {
+    // 🔧 2026-08-30: لازم نتأكد إنه في signedPdfDriveId فعلي كمان، مش بس signedAt - عشان عقود قديمة
+    // (زي M-Q-260212) صار فيها توقيع "نص ناجح" بسبب باغ رفع جوجل درايف يلي صلحناه فوق (signedAt
+    // انسجّل بس الملف الفعلي ما وصل درايف)، فضلت عالقة للأبد بترجع نفس رابط تحميل مكسور كل مرة.
+    // هلق أي عقد بهالحالة الناقصة بيعتبر "لسا مش موقّع فعليًا" وبيسمح للزبون يوقّع من جديد بشكل طبيعي
+    // (والمرة الجاية أكيد بينحفظ صح لأنه التصليح فوق ما بيسمح تصير نفس المشكلة تاني).
+    if (data.signedAt && data.signedPdfDriveId) {
       // موقّع أصلاً من قبل - منرجع نفس رابط التحميل بدل ما نكرر العملية ونولّد شهادة توقيع تانية
       return res.json({ ok: true, alreadySigned: true, downloadUrl: `/sign/${encodeURIComponent(ref)}/pdf?t=${encodeURIComponent(token)}` });
     }
