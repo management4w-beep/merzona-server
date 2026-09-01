@@ -1106,6 +1106,129 @@ app.get('/sign/:ref/preview-pdf', async (req, res) => {
 });
 
 // ============================================================================
+//  Employee salary portal (employee-facing, no login required)
+//  ------------------------------------------------------------------------
+//  فكرة مطابقة تمامًا لنظام توقيع العقود فوق - كل موظف بتبويب "الرواتب" بالداشبورد إله "viewToken"
+//  عشوائي (32 خانة hex) مولّد ومخزّن جوا سجله بنفسه (merzona_payroll_employees، نفس ملف المزامنة
+//  المشترك)، وبيتحقق منه هالمسار قبل ما يرجّع أي بيانات - رابط الموظف (salary.html?emp=..&t=..)
+//  ما بيشتغل إلا مع الرمز المطابق، فحتى لو موظف خمّن id موظف تاني ما رح يقدر يشوف بياناته.
+//  البيانات نفسها مقروءة مباشرة من ملف المزامنة (merzona-sync-data.json) بجوجل درايف - نفس المصدر
+//  يلي تبويب "الرواتب" بالداشبورد شغال عليه، فأي تحديث (تسجيل يوم شغل، تعليم "تم الدفع"...) بينعكس
+//  هون بأول مزامنة تالية من أي جهاز بالفريق - بدون أي كود إضافي أو تخزين مضاعف.
+// ============================================================================
+
+const PAYROLL_EMP_ID_PATTERN = /^[A-Za-z0-9_\-]{3,80}$/;
+
+const payrollViewLog = [];
+function isPayrollViewRateLimited() {
+  const now = Date.now();
+  while (payrollViewLog.length && now - payrollViewLog[0] > 3600 * 1000) payrollViewLog.shift();
+  return payrollViewLog.length >= 120;
+}
+// إرسال روابط الموظفين عبر واتساب محدود لحاله (منفصل عن الـ30/ساعة العام تبع الإشعارات) حتى ما
+// يزاحم إشعارات عروض الأسعار العادية لو حمدي بعت لعدة موظفين ورا بعض.
+const payrollSendLog = [];
+function isPayrollSendRateLimited() {
+  const now = Date.now();
+  while (payrollSendLog.length && now - payrollSendLog[0] > 3600 * 1000) payrollSendLog.shift();
+  return payrollSendLog.length >= 30;
+}
+
+// بيقرا ملف المزامنة المشترك (merzona-sync-data.json) ويرجّع بس المفتاحين يلي محتاجينهم - نفس
+// آلية driveGetOrCreateSyncFileId/driveDownloadBuffer المستخدمة فوق لإلحاق العقود الموقّعة، بس هون
+// قراءة بس (read-only) بدون أي كتابة.
+async function loadPayrollSyncData(token) {
+  const fileId = await driveGetOrCreateSyncFileId(token);
+  const buf = await driveDownloadBuffer(fileId, token);
+  let remote;
+  try {
+    remote = JSON.parse(buf.toString('utf8') || '{}');
+  } catch (e) {
+    remote = {};
+  }
+  return {
+    employees: remote.merzona_payroll_employees || {},
+    entries: remote.merzona_payroll_entries || {},
+  };
+}
+
+// بيانات صفحة الموظف - بيتحقق من تطابق الرمز السري (t) مع الرمز المخزّن جوا سجل الموظف نفسه قبل
+// ما يرجّع أي شي، بالضبط متل /sign/:ref فوق.
+app.get('/payroll/:empId', async (req, res) => {
+  const empId = String(req.params.empId || '').trim();
+  const token = String(req.query.t || '');
+  if (!PAYROLL_EMP_ID_PATTERN.test(empId)) return res.status(400).json({ error: 'bad-emp-id' });
+  if (!token) return res.status(400).json({ error: 'missing-token' });
+  if (isPayrollViewRateLimited()) return res.status(429).json({ error: 'rate-limit' });
+  payrollViewLog.push(Date.now());
+  try {
+    const driveToken = await getServerDriveAccessToken();
+    const { employees, entries } = await loadPayrollSyncData(driveToken);
+    const emp = employees[empId];
+    if (!emp) return res.status(404).json({ error: 'not-found' });
+    if (!emp.viewToken || emp.viewToken !== token) return res.status(401).json({ error: 'invalid-token' });
+    const empEntries = Object.keys(entries)
+      .map((id) => entries[id])
+      .filter((e) => e && e.empId === empId)
+      .sort((a, b) => {
+        const dA = a.type === 'daily' ? (a.date || '') : (a.month || '') + '-01';
+        const dB = b.type === 'daily' ? (b.date || '') : (b.month || '') + '-01';
+        return dB.localeCompare(dA);
+      })
+      .map((e) => ({
+        type: e.type,
+        date: e.date || null,
+        month: e.month || null,
+        note: e.note || '',
+        amount: e.amount || 0,
+        currency: e.currency || emp.currency || 'AED',
+        paid: !!e.paid,
+        paidAt: e.paidAt || null,
+      }));
+    res.json({
+      ok: true,
+      name: emp.name || '',
+      role: emp.role || '',
+      payType: emp.payType || 'daily',
+      rate: emp.rate || 0,
+      currency: emp.currency || 'AED',
+      entries: empEntries,
+    });
+  } catch (e) {
+    console.error('[Payroll] GET /payroll/:empId failed:', e);
+    const msg = e && e.message;
+    const code = msg === 'not-linked-yet' ? 503 : msg === 'not-configured' ? 500 : 500;
+    res.status(code).json({ error: msg || String(e) });
+  }
+});
+
+// بيبعت رابط الصفحة الشخصية لموظف معيّن عبر واتساب - مستدعى من زر "📤 إرسال عالواتساب" بجدول
+// "الموظفين" بالداشبورد (محمي بـcheckAuth متل أي مسار إداري تاني). 🔧 بعكس /send-quotation فوق -
+// هون منستنى (await) نتيجة الإرسال الفعلية قبل ما نرد، ومنرجّع نجاح/فشل حقيقي (مش queued فقط) -
+// طلب حمدي بالتحديد كان "بدي اعرف اذا تم الإرسال أو صار فيه مشكلة"، ورسالة نصية وحدة بدون مرفق
+// عادةً بتاخد ثواني قليلة فمفيش داعي لنمط "رد فوري + إرسال بالخلفية" المستخدم مع عروض الأسعار.
+app.post('/payroll/send-link', checkAuth, async (req, res) => {
+  if (!clientReady) return res.status(503).json({ ok: false, error: 'whatsapp-not-ready' });
+  if (isPayrollSendRateLimited()) return res.status(429).json({ ok: false, error: 'rate-limit' });
+  const { phone, empName, link } = req.body || {};
+  const digits = String(phone || '').replace(/[^0-9]/g, '');
+  if (!digits || digits.length < 8) return res.status(400).json({ ok: false, error: 'bad-phone' });
+  if (!link) return res.status(400).json({ ok: false, error: 'missing-link' });
+  try {
+    let msg = '👋 أهلاً';
+    if (empName) msg += ' ' + empName;
+    msg += '،\n\nهاد رابط صفحتك الخاصة لمتابعة رواتبك/مستحقاتك مع Merzona (خاص فيك بس):\n' + link;
+    payrollSendLog.push(Date.now());
+    await client.sendMessage(digits + '@c.us', msg);
+    console.log('[Payroll] ✅ تم إرسال رابط الموظف بنجاح -', empName || '(بدون اسم)');
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[Payroll] Failed to send employee link via WhatsApp:', e);
+    res.status(502).json({ ok: false, error: 'send-failed', detail: String((e && e.message) || e) });
+  }
+});
+
+// ============================================================================
 //  Login-approval system
 //  Every new browser/device that opens the Merzona tool is locked out until
 //  the owner approves it. The owner is notified instantly on WhatsApp with
