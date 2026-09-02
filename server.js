@@ -1149,6 +1149,10 @@ async function loadPayrollSyncData(token) {
   return {
     employees: remote.merzona_payroll_employees || {},
     entries: remote.merzona_payroll_entries || {},
+    // 🔧 2026-09-02: ناقصة من أول نسخة لهالمسار - بدونها صفحة الموظف كانت "عمياء" تمامًا عن أي
+    // دفعة فعلية مسجّلة من قسم "تسجيل دفعة" الجديد بتبويب الرواتب بالداشبورد (كانت بس شايفة حالة
+    // ✓/⏳ القديمة لكل سجل على حدة، مش الدفعات الفعلية الجزئية/العامة).
+    payments: remote.merzona_payroll_payments || {},
   };
 }
 
@@ -1163,7 +1167,7 @@ app.get('/payroll/:empId', async (req, res) => {
   payrollViewLog.push(Date.now());
   try {
     const driveToken = await getServerDriveAccessToken();
-    const { employees, entries } = await loadPayrollSyncData(driveToken);
+    const { employees, entries, payments } = await loadPayrollSyncData(driveToken);
     const emp = employees[empId];
     if (!emp) return res.status(404).json({ error: 'not-found' });
     if (!emp.viewToken || emp.viewToken !== token) return res.status(401).json({ error: 'invalid-token' });
@@ -1185,6 +1189,20 @@ app.get('/payroll/:empId', async (req, res) => {
         paid: !!e.paid,
         paidAt: e.paidAt || null,
       }));
+    const empPayments = Object.keys(payments)
+      .map((id) => payments[id])
+      .filter((p) => p && p.empId === empId)
+      .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || (b.createdAt || 0) - (a.createdAt || 0))
+      .map((p) => ({
+        date: p.date || null,
+        amount: p.amount || 0,
+        currency: p.currency || emp.currency || 'AED',
+        note: p.note || '',
+      }));
+    // نفس منطق renderPayrollSummary بالضبط بالداشبورد: المستحق الإجمالي = مجموع كل السجلات (بغض
+    // النظر عن حالة ✓/⏳ القديمة)، ناقص مجموع كل الدفعات الفعلية.
+    const totalAccrued = empEntries.reduce((s, e) => s + (e.amount || 0), 0);
+    const totalPaid = empPayments.reduce((s, p) => s + (p.amount || 0), 0);
     res.json({
       ok: true,
       name: emp.name || '',
@@ -1193,6 +1211,10 @@ app.get('/payroll/:empId', async (req, res) => {
       rate: emp.rate || 0,
       currency: emp.currency || 'AED',
       entries: empEntries,
+      payments: empPayments,
+      totalAccrued,
+      totalPaid,
+      totalDue: totalAccrued - totalPaid,
     });
   } catch (e) {
     console.error('[Payroll] GET /payroll/:empId failed:', e);
