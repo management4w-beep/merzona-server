@@ -73,6 +73,21 @@ if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
 // A secret only the tool's owner knows - used both to approve/deny/revoke device
 // requests, and as a one-time "owner bypass" link opened on the owner's own devices.
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+// 🛠️ إصلاح 2026-09-27 (فحص شامل - أولوية واطئة): كل مقارنات ADMIN_TOKEN بالسيرفر كانت تستخدم
+// === / !== العادية (مقارنة نص عادية بتوقف عند أول حرف مختلف) بدل مقارنة "محصّنة ضد قياس الوقت"
+// (timing-safe) متل verifyPassword تحت. الخطر النظري هون واطئ جدًا (كلمة سر معقدة يدوية، مش شي
+// بيتكرر آلاف المرات بالثانية عبر الشبكة)، بس منصلحها لتتماشى مع نفس معيار الأمان المستخدم لكلمات
+// سر المستخدمين بالأداة.
+function safeTokenEquals(a, b) {
+  const bufA = Buffer.from(String(a == null ? '' : a));
+  const bufB = Buffer.from(String(b == null ? '' : b));
+  if (bufA.length !== bufB.length) {
+    // منعمل مقارنة وهمية بنفس طول bufA حتى ما يصير فرق وقت واضح بين "طول غلط" و"طول صح بس محتوى غلط".
+    crypto.timingSafeEqual(bufA, bufA);
+    return false;
+  }
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 // The owner's personal WhatsApp number (digits only, with country code, no + or spaces,
 // e.g. 971501234567) - this is who gets notified when someone requests access.
 const OWNER_WHATSAPP_NUMBER = (process.env.OWNER_WHATSAPP_NUMBER || '').replace(/[^0-9]/g, '');
@@ -469,7 +484,7 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
 // Google account that owns the Drive folder, and approve. The server then stores
 // the refresh token itself - no copy/pasting secrets around.
 app.get('/drive-auth/start', (req, res) => {
-  if (!ADMIN_TOKEN || req.query.admin !== ADMIN_TOKEN) {
+  if (!ADMIN_TOKEN || !safeTokenEquals(req.query.admin, ADMIN_TOKEN)) {
     return res.status(401).send('<h2 style="font-family:sans-serif">غير مصرح - Unauthorized</h2>');
   }
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
@@ -497,7 +512,7 @@ app.get('/drive-auth/callback', async (req, res) => {
   if (error) {
     return res.status(400).send('<h2 style="font-family:sans-serif">صار خطأ من جوجل</h2><p>' + escapeHtml(String(error)) + '</p>');
   }
-  if (!ADMIN_TOKEN || state !== ADMIN_TOKEN) {
+  if (!ADMIN_TOKEN || !safeTokenEquals(state, ADMIN_TOKEN)) {
     return res.status(401).send('<h2 style="font-family:sans-serif">غير مصرح - Unauthorized</h2>');
   }
   if (!code) {
@@ -938,6 +953,13 @@ function isSignSubmitRateLimited() {
   while (signSubmitLog.length && now - signSubmitLog[0] > 3600 * 1000) signSubmitLog.shift();
   return signSubmitLog.length >= 20;
 }
+// 🛠️ إصلاح 2026-09-27 (فحص شامل): قبل هالإصلاح ما كان في أي حماية من إنو نفس طلب التوقيع (POST
+// /sign/:ref) ينوصل مرتين بسرعة (دبل-كليك من الزبون، أو إعادة محاولة تلقائية من المتصفح بسبب بطء
+// بالنت) - الاتنين كانوا يقروا data.signedAt "لسا فاضي" قبل ما أي واحد فيهم يوصل لكتابته، فبينتج
+// ملفين PDF موقّعين مرفوعين لجوجل درايف، ورسالتين واتساب، وسجلّين بلوحة التحكم لنفس العقد. هلق منمنع
+// أي طلب توقيع ثاني لنفس المرجع طول ما في وحد شغال عليه حاليًا بنفس السيرفر (قفل بالذاكرة كافي هون
+// لأنو هالسيرفر بيشتغل كعملية Node وحدة - نفس افتراض whatsapp-web.js نفسها يلي محتاجة جلسة وحيدة).
+const signInProgressRefs = new Set();
 
 // معلومات العرض المطلوب توقيعه - بتتأكد من تطابق الرمز السري (t) أول شي قبل ما ترجع أي معلومة.
 app.get('/sign/:ref', async (req, res) => {
@@ -986,6 +1008,12 @@ app.post('/sign/:ref', async (req, res) => {
   if (isSignSubmitRateLimited()) return res.status(429).json({ error: 'rate-limit' });
   signSubmitLog.push(Date.now());
 
+  // 🛠️ إصلاح 2026-09-27 (فحص شامل): شوف تعليق signInProgressRefs فوق - نمنع أي طلب توقيع ثاني لنفس
+  // المرجع طول ما الأول لسا شغال (دبل-كليك أو إعادة محاولة تلقائية من المتصفح).
+  if (signInProgressRefs.has(ref)) {
+    return res.status(409).json({ error: 'sign-in-progress' });
+  }
+  signInProgressRefs.add(ref);
   try {
     const driveToken = await getServerDriveAccessToken();
     const found = await loadQuotationDataFile(ref, driveToken);
@@ -1035,18 +1063,35 @@ app.post('/sign/:ref', async (req, res) => {
     data.signedPdfDriveId = uploaded.id;
     await saveQuotationDataFile(fileId, data, driveToken);
 
-    try {
-      await appendSignedContractToSyncData(driveToken, {
-        ref,
-        clientName,
-        fileEntry: {
-          name: ref + '-signed.pdf',
-          driveFileId: uploaded.id,
-          driveViewLink: uploaded.webViewLink || 'https://drive.google.com/file/d/' + uploaded.id + '/view',
-        },
-      });
-    } catch (syncErr) {
-      console.error('[Sign] Failed to update shared sync data (contract will need to be added manually in Dashboard):', syncErr);
+    // 🛠️ إصلاح 2026-09-27 (فحص شامل): قبل هالإصلاح، فشل هالخطوة كان يتسجّل بسجلات السيرفر فقط
+    // (console.error) - محدا كان بينتبه، والعقد كان يضل "موقّع بنجاح" من ناحية الزبون بس ما بيظهر
+    // أبدًا بتبويب "العقود" بلوحة التحكم بدون أي تنبيه للإدارة. هلق منعيد المحاولة كم مرة (تعارض
+    // كتابة عابر ممكن يزول لحاله بإعادة محاولة قريبة)، وإذا استمر الفشل منبعت تنبيه مباشر لواتساب
+    // صاحب العمل حتى يعرف إنو في عقد لازم يضاف يدويًا.
+    let syncOk = false;
+    let lastSyncErr = null;
+    for (let attempt = 0; attempt < 3 && !syncOk; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 500 * attempt));
+      try {
+        await appendSignedContractToSyncData(driveToken, {
+          ref,
+          clientName,
+          fileEntry: {
+            name: ref + '-signed.pdf',
+            driveFileId: uploaded.id,
+            driveViewLink: uploaded.webViewLink || 'https://drive.google.com/file/d/' + uploaded.id + '/view',
+          },
+        });
+        syncOk = true;
+      } catch (syncErr) {
+        lastSyncErr = syncErr;
+      }
+    }
+    if (!syncOk) {
+      console.error('[Sign] Failed to update shared sync data after retries (contract will need to be added manually in Dashboard):', lastSyncErr);
+      notifyOwnerOfSystemIssue(
+        `⚠️ *تنبيه نظام*\nالعقد ${ref} انوقّع من الزبون بنجاح، بس صار خطأ تقني وما انسجّل تلقائيًا بتبويب "العقود" بلوحة التحكم.\nلازم يتضاف يدويًا من تبويب العقود (الملف الموقّع موجود بجوجل درايف بمجلد العرض، تحت "عقود مرفقة").`
+      );
     }
 
     let whatsappWarning = null;
@@ -1063,6 +1108,8 @@ app.post('/sign/:ref', async (req, res) => {
     const msg = e && e.message;
     const code = msg === 'not-linked-yet' ? 503 : 500;
     res.status(code).json({ error: msg || String(e) });
+  } finally {
+    signInProgressRefs.delete(ref);
   }
 });
 
@@ -1073,6 +1120,11 @@ app.get('/sign/:ref/pdf', async (req, res) => {
   const token = String(req.query.t || '');
   if (!REF_PATTERN.test(ref)) return res.status(400).send('bad ref');
   if (!token) return res.status(400).send('missing token');
+  // 🛠️ إصلاح 2026-09-27 (فحص شامل): هاد المسار كان الوحيد من بين المسارات الثلاثة المشابهة
+  // (GET /sign/:ref و GET /sign/:ref/preview-pdf وهاد) اللي ناقصه حد أقصى لعدد الطلبات بالساعة -
+  // كان ممكن يستهلك حصة Google Drive المشتركة لو حدا (أو خطأ ببرنامج) قصفه بطلبات كتير.
+  if (isSignViewRateLimited()) return res.status(429).send('rate limit');
+  signViewLog.push(Date.now());
   try {
     const driveToken = await getServerDriveAccessToken();
     const found = await loadQuotationDataFile(ref, driveToken);
@@ -1291,6 +1343,17 @@ function notifyOwnerOfAccessRequest(deviceToken, name) {
   client.sendMessage(OWNER_WHATSAPP_NUMBER + '@c.us', msg).catch((e) => console.error('[Access] Failed to notify owner on WhatsApp:', e));
 }
 
+// 🆕 2026-09-27 (فحص شامل): تنبيه واتساب مباشر لصاحب العمل عن مشاكل تقنية خلفية (مش طلبات دخول -
+// شوف notifyOwnerOfAccessRequest فوق لهاد) لازم ينتبه فيها، بدل ما تضل مدفونة بسجلات السيرفر التقنية
+// يلي محدا بيراجعها عادةً (مثال: عقد انوقّع بنجاح بس ما انسجّل بلوحة التحكم لسبب تقني).
+function notifyOwnerOfSystemIssue(text) {
+  if (!(clientReady && OWNER_WHATSAPP_NUMBER)) {
+    console.warn('[System] Could not send WhatsApp alert (WhatsApp not ready or owner number not configured):', text);
+    return;
+  }
+  client.sendMessage(OWNER_WHATSAPP_NUMBER + '@c.us', text).catch((e) => console.error('[System] Failed to send system-issue alert on WhatsApp:', e));
+}
+
 // Called by the tool when a device requests access (or when the owner opens
 // their one-time "owner bypass" link, which sends adminToken instead).
 app.post('/access/request', async (req, res) => {
@@ -1303,10 +1366,15 @@ app.post('/access/request', async (req, res) => {
 
     // Owner bypass: only works if the caller supplies the real ADMIN_TOKEN (never
     // shipped inside the tool's own source - the owner pastes it into the URL once).
-    if (adminToken && ADMIN_TOKEN && adminToken === ADMIN_TOKEN) {
+    // 🛠️ إصلاح 2026-09-27 (فحص شامل - ثغرة أمان): بهالمسار بالذات (اسمك = كلمة سر الأدمن)، الواجهة
+    // (index.html) بتبعت نفس القيمة كـname وadminToken سوا - يعني قبل هالإصلاح كنا نخزّن كلمة سر
+    // الأدمن نفسها بالنص الصريح كـ"اسم الجهاز" بملف devices.json، وهاد الاسم قابل للقراءة من أي حدا
+    // معه توكن الجهاز عبر GET /access/status (مسار بدون أي حماية/توكن أدمن). هلق منخزّن اسم عام ثابت
+    // بدل الاسم المكتوب فعليًا بهالحالة تحديدًا، حتى ما تنكشف كلمة السر الحقيقية لأي حدا.
+    if (adminToken && ADMIN_TOKEN && safeTokenEquals(adminToken, ADMIN_TOKEN)) {
       const prior = devices[deviceToken];
       devices[deviceToken] = {
-        name: (name || 'Owner device').toString().slice(0, 80),
+        name: 'Owner (bypass)',
         status: 'approved',
         requestedAt: (prior && prior.requestedAt) || Date.now(),
         approvedAt: Date.now(),
@@ -1370,7 +1438,7 @@ app.get('/access/status', (req, res) => {
 // One-tap link the owner opens from the WhatsApp notification (or the admin panel).
 app.get('/access/approve', (req, res) => {
   const { admin, device, action } = req.query;
-  if (!ADMIN_TOKEN || admin !== ADMIN_TOKEN) {
+  if (!ADMIN_TOKEN || !safeTokenEquals(admin, ADMIN_TOKEN)) {
     return res.status(401).send('<h2 style="font-family:sans-serif">غير مصرح - Unauthorized</h2>');
   }
   const devices = loadDevices();
@@ -1401,7 +1469,7 @@ app.get('/access/approve', (req, res) => {
 // Full list of devices (pending/approved/denied/revoked) with inline actions - a fallback
 // for when the owner missed the WhatsApp notification, and the only way to revoke access.
 app.get('/access/admin', (req, res) => {
-  if (!ADMIN_TOKEN || req.query.admin !== ADMIN_TOKEN) {
+  if (!ADMIN_TOKEN || !safeTokenEquals(req.query.admin, ADMIN_TOKEN)) {
     return res.status(401).send('<h2 style="font-family:sans-serif">غير مصرح - Unauthorized</h2>');
   }
   const devices = loadDevices();
@@ -1556,7 +1624,7 @@ function publicUser(key, u) {
 // طريقة نظام موافقة الأجهزة تمامًا)، أو عن طريق حساب مستخدم عادي متعلّم isAdmin:true.
 function resolveAdmin(req) {
   const adminToken = (req.body && req.body.adminToken) || req.query.adminToken;
-  if (adminToken && ADMIN_TOKEN && adminToken === ADMIN_TOKEN) {
+  if (adminToken && ADMIN_TOKEN && safeTokenEquals(adminToken, ADMIN_TOKEN)) {
     return { isOwner: true, username: null };
   }
   // جهاز المالك المعتمد (isOwner:true بنظام موافقة الواتساب) - هيك تبويب "المستخدمين" بالداشبورد
