@@ -599,7 +599,21 @@ app.get('/drive-token', checkAuth, async (req, res) => {
 //  الرقم المرجعي، فتخمين رقم مرجعي (حتى لو كان تسلسلي وسهل التخمين) لحاله ما كافي.
 // ============================================================================
 
-const DRIVE_ROOT_FOLDER_ID_SERVER = '13q5WtejXrydWEeIEZ7pZoon6ocyVuX1D'; // نفس مجلد جوجل درايف الرئيسي المستخدم بكل أدوات ميرزونا
+const DRIVE_ROOT_FOLDER_ID_SERVER = '13q5WtejXrydWEeIEZ7pZoon6ocyVuX1D'; // نفس مجلد جوجل درايف الرئيسي (فرع الإمارات) المستخدم بكل أدوات ميرزونا
+// 🛠️ إصلاح 2026-09-27 (بلاغ حمدي: مسح QR code لرابط التوقيع تبع عرض سعر مرجعه بحرف S، مثلاً
+// S-Q-260002، بيرجّع "ما لقينا عرض السعر / الرابط قديم أو غير صحيح" رغم إنو العرض محفوظ فعليًا وهو
+// آخر نسخة). السبب الجذري: index.html بيحفظ عروض فرع دمشق/سوريا (أي مرجع يبلش بحرف S - شوف
+// getBranchFromRef/DRIVE_ROOT_FOLDER_ID_SYRIA هناك) بمجلد جوجل درايف منفصل كليًا عن مجلد الإمارات
+// (نفس حساب جوجل درايف، مجلد شقيق مختلف). بس locateRefFolderId تحت كانت دايمًا بتدوّر بمجلد الإمارات
+// وبس (DRIVE_ROOT_FOLDER_ID_SERVER فوق) بغض النظر عن حرف المرجع - فأي عرض سوري ما كان ينلاقى إطلاقًا
+// من جهة السيرفر (رابط التوقيع/QR)، حتى لو محفوظ صح 100% بجوجل درايف. الحل: نفس منطق الفرع الموجود
+// أصلًا بـindex.html (حرف المرجع S = سوريا) هون كمان، ومنختار مجلد جوجل درايف الصحيح حسبه.
+const DRIVE_ROOT_FOLDER_ID_SYRIA_SERVER = '1tQkVAUHGy9_Tm2JZxlkkTvGUTxAWM8uS'; // نفس مجلد فرع دمشق/سوريا (DRIVE_ROOT_FOLDER_ID_SYRIA بـindex.html)
+function getDriveRootFolderIdForRefServer(refRaw) {
+  const m = String(refRaw || '').trim().match(/^([A-Za-z])-?Q-/i);
+  if (m && m[1].toUpperCase() === 'S') return DRIVE_ROOT_FOLDER_ID_SYRIA_SERVER;
+  return DRIVE_ROOT_FOLDER_ID_SERVER;
+}
 const SYNC_FILE_NAME = 'merzona-sync-data.json'; // نفس ملف المزامنة المشترك يلي الداشبورد بيقرأ/يكتب منه
 
 function getYearFromReferenceServer(refRaw) {
@@ -712,7 +726,8 @@ async function driveUpdateFileContent(fileId, mimeType, buffer, token) {
 // بعد من الأداة، فمنعتبرها "not-found" بدل ما ننشئ مجلدات فاضية.
 async function locateRefFolderId(ref, token) {
   const year = getYearFromReferenceServer(ref);
-  const yearFolder = await driveFindItemInParent(year, DRIVE_ROOT_FOLDER_ID_SERVER, token);
+  const rootFolderId = getDriveRootFolderIdForRefServer(ref); // 🛠️ 2026-09-27: شوف الشرح فوق - مرجع بحرف S لازم يدوّر بمجلد سوريا، مش مجلد الإمارات دايمًا
+  const yearFolder = await driveFindItemInParent(year, rootFolderId, token);
   if (!yearFolder) return null;
   const refFolder = await driveFindItemInParent(ref, yearFolder.id, token);
   return refFolder ? refFolder.id : null;
