@@ -582,8 +582,27 @@ async function getServerDriveAccessToken() {
 // بتنادى عليه أداة الفاتورة والداشبورد عوضًا عن ما تفتح نافذة جوجل بنفسها - بيرجع توكن جاهز صالح
 // لساعة تقريبًا، مبني على الـ refresh token المخزّن فوق. نفس AUTH_TOKEN تبع بقية السيرفر (x-api-key
 // أو ?token=) - حتى ما يقدر أي حدا غريب يطلب توكن درايف حي من هون.
+// 🛠️ إصلاح 2026-09-28 (فحص شامل جولة ٢): AUTH_TOKEN الثابت وحده كان كافي لتوليد توكن درايف حي حتى
+// لو الجهاز/الحساب يلي طلبه متسحب صلاحياته (revoked) أو محذوف بالكامل - لأنو هالمسار ما كان أصلًا
+// بيتحقق من أي شي غير التوكن الثابت (نفسه مكتوب بصريح النص جوا Dashboard.html، فأي حدا فتح "View
+// Source" مرة عرفه). هلق: لما الطلب جاي مع ?device=<deviceToken> (متل الداشبورد الآن - شوف
+// fetchDashDriveTokenFromServer)، منتحقق كمان إنو هالجهاز موجود بdevices.json وحالته 'approved'
+// حاليًا، وإلا منرفض بـ403. هيك سحب صلاحية جهاز (أو حذف حساب مستخدم مرتبط فيه - شوف /users/delete
+// تحت) بيوقف طلبات توكن درايف الجديدة الفورية. ملاحظة مهمة: توكن درايف يلي كان صادر ومخزّن مسبقًا
+// (بالمتصفح، بذاكرة الجهاز) بضل صالح لحد ما تنتهي صلاحيته الطبيعية عند جوجل (~ساعة) - ما في طريقة
+// نلغيه رجعيًا، هاد قيد من طبيعة OAuth نفسها مو تقصير بالإصلاح. أدوات تانية (index.html/designer.html)
+// ممكن تنادي هالمسار بدون ما يكون عندها deviceToken أصلًا (زبون بيوقّع عرض سعر مثلاً) - فمنخلي فحص
+// الجهاز يصير بس لما ?device= مبعوت فعليًا، حتى ما نكسر هالمسارات التانية.
 app.get('/drive-token', checkAuth, async (req, res) => {
   try {
+    const deviceParam = (req.query.device || '').toString();
+    if (deviceParam) {
+      const devices = loadDevices();
+      const entry = devices[deviceParam];
+      if (!entry || entry.status !== 'approved') {
+        return res.status(403).json({ error: 'device-not-approved' });
+      }
+    }
     const access_token = await getServerDriveAccessToken();
     res.json({ access_token, expires_in: 3600 });
   } catch (e) {
@@ -766,44 +785,115 @@ async function saveQuotationDataFile(fileId, data, token) {
   await driveUpdateFileContent(fileId, 'application/json', Buffer.from(JSON.stringify(data)), token);
 }
 
+// 🛠️ إصلاح 2026-09-28 (فحص شامل جولة ٢): كانت هالدالة تعمل "تحقق ثم أنشئ" (check-then-create) بدون
+// أي قفل - لو أول عملية توقيع بحياة السيرفر (أو أول عملية بعد ما ينحذف/ينفقد ملف merzona-sync-data.json)
+// صادف إنها صارت مرتين تقريبًا بنفس اللحظة لمرجعين مختلفين، الاتنين كانوا ممكن يوصلوا لنفس النتيجة
+// "مش موجود" ويعملوا driveUploadBuffer وينشئوا ملفين merzona-sync-data.json منفصلين بنفس المجلد -
+// "انفصام" بالبيانات (split-brain) صعب التشخيص لاحقًا. هلق: أول استدعاء بيبلش عملية "دور أو أنشئ"
+// واحدة بس ويخزّنها كـ Promise مشترك (syncFileIdInFlight)، وأي استدعاء تاني يوصل قبل ما تخلص هالعملية
+// بينتظر نفس النتيجة بدل ما يعمل عملية موازية لحاله - فمستحيل يصير ملفين. بعد أول نجاح، بنخزّن الـ id
+// نهائيًا (syncFileIdCache) فما في حتى حاجة نعيد البحث كل مرة.
+let syncFileIdCache = null;
+let syncFileIdInFlight = null;
 async function driveGetOrCreateSyncFileId(token) {
-  const found = await driveFindItemInParent(SYNC_FILE_NAME, DRIVE_ROOT_FOLDER_ID_SERVER, token);
-  if (found) return found.id;
-  const created = await driveUploadBuffer(SYNC_FILE_NAME, 'application/json', Buffer.from('{}'), DRIVE_ROOT_FOLDER_ID_SERVER, token);
-  return created.id;
+  if (syncFileIdCache) return syncFileIdCache;
+  if (syncFileIdInFlight) return syncFileIdInFlight;
+  syncFileIdInFlight = (async () => {
+    const found = await driveFindItemInParent(SYNC_FILE_NAME, DRIVE_ROOT_FOLDER_ID_SERVER, token);
+    if (found) return found.id;
+    const created = await driveUploadBuffer(SYNC_FILE_NAME, 'application/json', Buffer.from('{}'), DRIVE_ROOT_FOLDER_ID_SERVER, token);
+    return created.id;
+  })();
+  try {
+    const id = await syncFileIdInFlight;
+    syncFileIdCache = id;
+    return id;
+  } finally {
+    syncFileIdInFlight = null;
+  }
+}
+
+// 🛠️ إصلاح 2026-09-28 (فحص شامل جولة ٢): قفل بالذاكرة بسيط (promise chain) بيضمن إنو أي عمليتين
+// كتابة لملف merzona-sync-data.json من عندنا (نفس عملية السيرفر) ينفّذوا بالتسلسل، وحدة بعد التانية،
+// حتى لو وصلوا "بنفس اللحظة" (مثلاً توقيع عقدين مختلفين بفارق كذا ثانية بس عن بعض). كل استدعاء
+// جديد بينتظر لحد ما الاستدعاء يلي قبله يخلص (نجح أو فشل) قبل ما يبلش هو.
+let syncDataMutex = Promise.resolve();
+function runExclusiveOnSyncData(fn) {
+  const run = syncDataMutex.then(fn, fn);
+  syncDataMutex = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 // منحقن سجل العقد + الملف المرفق مباشرة جوا ملف المزامنة المشترك - بنفس بالضبط نظام الطوابع
 // الزمنية لكل سجل (per-record timestamp) يلي الداشبورد نفسه بيعتمد عليه بمنطق الدمج (نفس فكرة
 // mergeOneSyncKey جوا Dashboard.html) - فأي جهاز موظف بيفتح الداشبورد بعدين، أو يعمل مزامنة/مطابقة،
 // بيلتقط هالتحديث تلقائيًا كأنو موظف تاني ضافه من جهازه هو بالضبط.
+// 🛠️ إصلاح 2026-09-28 (فحص شامل جولة ٢ - أخطر باغ لقيناه بكل الجولتين): هالدالة بتعمل تنزيل كامل
+// لملف merzona-sync-data.json → تعديل بالذاكرة → رفع كامل من جديد. لو مرجعين مختلفين انوقعوا بفارق
+// كذا ثانية بس عن بعض، كانوا كل واحد فيهم يقرا نفس النسخة القديمة، وبعدين يرفع نسخته هو فوق نسخة
+// التاني - يعني عقد الأول كان يختفي بصمت من تبويب "العقود" باللوحة رغم إنو الزبون شاف "تم التوقيع
+// بنجاح" فعليًا وملفه موجود بجوجل درايف. الحل بطبقتين:
+//  1. runExclusiveOnSyncData فوق - بيمنع تعارض بين طلبين توقيع مختلفين وصلوا هالدالة بنفس الوقت
+//     تقريبًا من نفس عملية السيرفر (الحالة الأكتر احتمالًا واللي وصفها البلاغ).
+//  2. تحقق إضافي قبل الكتابة النهائية (الحلقة تحت): منعيد تنزيل الملف ونقارنه مع النسخة يلي بنينا
+//     تعديلنا فوقها - لو تغيّر (كاتب تاني، مثلاً Dashboard.html من متصفح موظف، كتب بالفترة القصيرة
+//     يلي بين قراءتنا وكتابتنا)، منعيد تطبيق نفس تعديلنا (إضافة سجل العقد/الملف) فوق النسخة الطازة
+//     بدل ما نمسح تعديل الكاتب التاني بالغلط. هيك لمرتين كحد أقصى. هاد بيصغّر نافذة التعارض من "كذا
+//     ثانية" (وقت توليد PDF ورفعه بالكامل) لـ"جزء من الثانية" (وقت إعادة التنزيل والمقارنة بس) - مش
+//     حل جذري 100% (الحل الجذري الحقيقي يحتاج ETag/رقم إصدار توفره جوجل درايف نفسها وما عنا دالة
+//     جاهزة لهيك هلق) بس بيقفل الغالبية العظمى من الاحتمال الفعلي.
 async function appendSignedContractToSyncData(token, { ref, clientName, fileEntry }) {
-  const fileId = await driveGetOrCreateSyncFileId(token);
-  const buf = await driveDownloadBuffer(fileId, token);
-  let remote;
-  try {
-    remote = JSON.parse(buf.toString('utf8') || '{}');
-  } catch (e) {
-    remote = {};
-  }
-  const now = Date.now();
+  return runExclusiveOnSyncData(async () => {
+    const fileId = await driveGetOrCreateSyncFileId(token);
 
-  remote.merzona_contracts = remote.merzona_contracts || {};
-  remote.merzona_contracts__ts = remote.merzona_contracts__ts || {};
-  if (!remote.merzona_contracts[ref]) {
-    remote.merzona_contracts[ref] = { client: clientName || '—', paymentTables: [], createdAt: now };
-    remote.merzona_contracts__ts[ref] = now;
-  }
+    function applyMutation(remoteObj) {
+      const now = Date.now();
+      remoteObj.merzona_contracts = remoteObj.merzona_contracts || {};
+      remoteObj.merzona_contracts__ts = remoteObj.merzona_contracts__ts || {};
+      if (!remoteObj.merzona_contracts[ref]) {
+        remoteObj.merzona_contracts[ref] = { client: clientName || '—', paymentTables: [], createdAt: now };
+        remoteObj.merzona_contracts__ts[ref] = now;
+      }
+      remoteObj.merzona_contract_files = remoteObj.merzona_contract_files || {};
+      remoteObj.merzona_contract_files__ts = remoteObj.merzona_contract_files__ts || {};
+      const existing = remoteObj.merzona_contract_files[ref];
+      const list = Array.isArray(existing) ? existing.slice() : existing ? [existing] : [];
+      // منمنع تكرار نفس الملف بالضبط لو صارت إعادة محاولة (retry) على نفس البيانات
+      const alreadyThere = fileEntry && fileEntry.driveFileId
+        ? list.some((f) => f && f.driveFileId === fileEntry.driveFileId)
+        : false;
+      if (!alreadyThere) list.push(fileEntry);
+      remoteObj.merzona_contract_files[ref] = list;
+      remoteObj.merzona_contract_files__ts[ref] = now;
+      return remoteObj;
+    }
 
-  remote.merzona_contract_files = remote.merzona_contract_files || {};
-  remote.merzona_contract_files__ts = remote.merzona_contract_files__ts || {};
-  const existing = remote.merzona_contract_files[ref];
-  const list = Array.isArray(existing) ? existing.slice() : existing ? [existing] : [];
-  list.push(fileEntry);
-  remote.merzona_contract_files[ref] = list;
-  remote.merzona_contract_files__ts[ref] = now;
+    const initialBuf = await driveDownloadBuffer(fileId, token);
+    let baselineJSON = initialBuf.toString('utf8') || '{}';
+    let remote;
+    try {
+      remote = JSON.parse(baselineJSON);
+    } catch (e) {
+      remote = {};
+    }
+    remote = applyMutation(remote);
 
-  await driveUpdateFileContent(fileId, 'application/json', Buffer.from(JSON.stringify(remote)), token);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const freshBuf = await driveDownloadBuffer(fileId, token);
+      const freshJSON = freshBuf.toString('utf8') || '{}';
+      if (freshJSON === baselineJSON) break; // ما تغيّر شي من وقت ما قرينا - آمن نكتب تعديلنا كما هو
+      let freshRemote;
+      try {
+        freshRemote = JSON.parse(freshJSON || '{}');
+      } catch (e) {
+        freshRemote = {};
+      }
+      remote = applyMutation(freshRemote);
+      baselineJSON = freshJSON;
+    }
+
+    await driveUpdateFileContent(fileId, 'application/json', Buffer.from(JSON.stringify(remote)), token);
+  });
 }
 
 // بيولّد صفحة "شهادة توقيع إلكتروني" (HTML → PDF عبر Puppeteer/كروميوم) - منستخدم كروميوم بدل ما
@@ -983,6 +1073,13 @@ app.get('/sign/:ref', async (req, res) => {
       signed: !!data.signedAt,
       signedAt: data.signedAt || null,
       signerName: data.signerName || null,
+      // 🛠️ إصلاح 2026-09-28 (فحص شامل جولة ٢ - ملاحظة بسيطة): لو حدا فتح رابط التوقيع (GET) بالضبط
+      // أثناء ما POST /sign/:ref لنفس المرجع شغالة بالخلفية (بتبويب/طلب تاني)، كان ممكن يوصله
+      // signed:false لمدة كذا ثانية رغم إنو التوقيع فعليًا عم يصير حاليًا - مش تلف بيانات، بس تجربة
+      // مربكة. هلق منرجّع inProgress:true بهيك حالة تحديدًا، حتى أي صفحة عرض (sign.html أو غيرها)
+      // تقدر تفرّق بين "لسا ما وقّع أبدًا" و"عم يوقّع هلق، استنى ثانية" لو حبت تستخدم هالحقل - هاد
+      // الحقل إضافة متوافقة للخلف (backward-compatible)، أي صفحة قديمة بتتجاهله بدون أي مشكلة.
+      inProgress: !data.signedAt && signInProgressRefs.has(ref),
     });
   } catch (e) {
     console.error('[Sign] GET /sign failed:', e);
@@ -1821,6 +1918,7 @@ app.post('/users/delete', (req, res) => {
   const key = normalizeUsername(username);
   const users = loadUsers();
   if (!users[key]) return res.status(404).json({ error: 'user not found' });
+  const deletedDeviceToken = users[key].deviceToken;
   delete users[key];
   saveUsers(users);
   const sessions = loadSessions();
@@ -1828,6 +1926,19 @@ app.post('/users/delete', (req, res) => {
     if (sessions[t].username === key) delete sessions[t];
   });
   saveSessions(sessions);
+  // 🛠️ إصلاح 2026-09-28 (فحص شامل جولة ٢): حذف حساب المستخدم هون كان يمسح الحساب والجلسات بس -
+  // جهازه كان يضل 'approved' بdevices.json متل ما هو، فيقدر (أو أي حدا تاني معه نفس الجهاز/متصفحه)
+  // يستمر ياخد توكن درايف حي من /drive-token فوق (يلي هلق بيتحقق من حالة الجهاز) رغم إنو حسابه
+  // بالكامل محذوف. هلق منسحب صلاحية الجهاز المرتبط (status: 'revoked') بنفس لحظة حذف الحساب.
+  if (deletedDeviceToken) {
+    const devices = loadDevices();
+    const deviceEntry = devices[deletedDeviceToken];
+    if (deviceEntry && deviceEntry.status === 'approved') {
+      deviceEntry.status = 'revoked';
+      deviceEntry.revokedAt = Date.now();
+      saveDevices(devices);
+    }
+  }
   res.json({ ok: true });
 });
 
