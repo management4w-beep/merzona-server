@@ -451,13 +451,27 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
       // Attach the quotation PDF itself when the tool sent one along - falls back to a
       // plain text message (still useful) if the PDF is missing or fails to attach for
       // any reason, so a PDF problem never blocks the notification from going out.
+      // 🆕 2026-09-29 (طلب/ملاحظة حمدي: الرسالة وصلت بس بدون مرفق PDF) - فحصنا اللوغ ولقينا الخطأ
+      // الحقيقي: "Data passed to getter must include an id property... but got undefined" - هاد خطأ
+      // معروف ومتكرر بمكتبة whatsapp-web.js لما بيصير إرسال مرفق (media) لمجموعة/محادثة قبل ما تخلص
+      // صفحة واتساب ويب الداخلية (Puppeteer) تحمّل/تخزّن بيانات هاي المحادثة بالكامل بذاكرتها -
+      // بيصير غالبًا أول رسالة مرفق بعد تسجيل دخول جديد (QR) أو بعد إعادة تشغيل السيرفر، وبيزول لحاله
+      // خلال ثواني قليلة. فبدل ما نستسلم فورًا للنص بس، منعيد المحاولة مرة وحدة بعد مهلة قصيرة (4
+      // ثواني) قبل ما نرجع للنص بس - هيك أغلب الحالات (تحديدًا هاي بالذات) بتنحل تلقائيًا بمحاولة تانية.
       if (pdfBase64) {
+        const media = new MessageMedia('application/pdf', pdfBase64, (pdfFilename || 'quotation.pdf').toString());
         try {
-          const media = new MessageMedia('application/pdf', pdfBase64, (pdfFilename || 'quotation.pdf').toString());
           await client.sendMessage(GROUP_ID, media, { caption: msg });
         } catch (mediaErr) {
-          console.error('[WhatsApp] Failed to attach PDF, sending text-only instead:', mediaErr);
-          await client.sendMessage(GROUP_ID, msg);
+          console.warn('[WhatsApp] ⚠️ فشلت أول محاولة لإرفاق PDF (رح نعيد المحاولة بعد 4 ثواني):', mediaErr);
+          await new Promise((resolve) => setTimeout(resolve, 4000));
+          try {
+            await client.sendMessage(GROUP_ID, media, { caption: msg });
+            console.log('[WhatsApp] ✅ نجحت المحاولة الثانية لإرفاق PDF.');
+          } catch (mediaErr2) {
+            console.error('[WhatsApp] ❌ فشلت المحاولة الثانية كمان - رح تنبعت الرسالة كنص بس بدون مرفق:', mediaErr2);
+            await client.sendMessage(GROUP_ID, msg);
+          }
         }
       } else {
         await client.sendMessage(GROUP_ID, msg);
@@ -1026,7 +1040,17 @@ async function sendSignedContractToWhatsApp({ ref, clientName, total, signerName
   msg += `الموقّع: ${signerName}\n`;
   const pdfBase64 = pdfBuffer.toString('base64');
   const media = new MessageMedia('application/pdf', pdfBase64, ref + '-signed.pdf');
-  await client.sendMessage(CONTRACTS_GROUP_ID, media, { caption: msg });
+  // 🆕 2026-09-29: نفس إصلاح إعادة المحاولة المطبّق بمسار /send-quotation (شوف التعليق هناك) - خطأ
+  // "getter must include an id property" بمكتبة whatsapp-web.js عابر غالبًا، فمنعطيه فرصة تانية بعد
+  // مهلة قصيرة قبل ما نستسلم بالكامل (هون - بعكس عرض السعر - ما في نص بديل لو فشلت المحاولتين، فمهم
+  // نجرب مرتين قبل ما نرمي الخطأ لفوق).
+  try {
+    await client.sendMessage(CONTRACTS_GROUP_ID, media, { caption: msg });
+  } catch (mediaErr) {
+    console.warn('[WhatsApp] ⚠️ فشلت أول محاولة لإرسال العقد الموقّع (رح نعيد المحاولة بعد 4 ثواني):', mediaErr);
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    await client.sendMessage(CONTRACTS_GROUP_ID, media, { caption: msg });
+  }
 }
 
 const REF_PATTERN = /^[A-Za-z0-9\-_؀-ۿ]{3,60}$/;
