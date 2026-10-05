@@ -300,17 +300,10 @@ function isRateLimited() {
 }
 
 // ---- Login-approval system: simple JSON-file device store ----
-function loadDevices() {
-  try {
-    return JSON.parse(fs.readFileSync(ACCESS_DATA_PATH, 'utf8'));
-  } catch (e) {
-    return {};
-  }
-}
+function loadDevices() { return readJsonStore(ACCESS_DATA_PATH); }
 function saveDevices(devices) {
   try {
-    fs.mkdirSync(path.dirname(ACCESS_DATA_PATH), { recursive: true });
-    fs.writeFileSync(ACCESS_DATA_PATH, JSON.stringify(devices, null, 2));
+    writeJsonStore(ACCESS_DATA_PATH, devices);
   } catch (e) {
     console.error('[Access] Failed to save devices store:', e);
   }
@@ -610,12 +603,10 @@ async function getServerDriveAccessToken() {
 app.get('/drive-token', checkAuth, async (req, res) => {
   try {
     const deviceParam = (req.query.device || '').toString();
-    if (deviceParam) {
-      const devices = loadDevices();
-      const entry = devices[deviceParam];
-      if (!entry || entry.status !== 'approved') {
-        return res.status(403).json({ error: 'device-not-approved' });
-      }
+    const devices = loadDevices();
+    const entry = Object.prototype.hasOwnProperty.call(devices, deviceParam) ? devices[deviceParam] : null;
+    if (!entry || entry.status !== 'approved') {
+      return res.status(403).json({ error: 'device-not-approved' });
     }
     const access_token = await getServerDriveAccessToken();
     res.json({ access_token, expires_in: 3600 });
@@ -626,6 +617,44 @@ app.get('/drive-token', checkAuth, async (req, res) => {
     console.error('[Drive Token] Failed:', e);
     res.status(502).json({ error: 'refresh-failed' });
   }
+});
+
+// 🔒 2026-10-05 (فحص شامل - خصوصية): قائمة عروض الأسعار القديمة بالداشبورد (أسماء عملاء/أرقام/مبالغ) كانت مكتوبة جوا
+// Dashboard.html نفسه، يعني أي حدا بيفتح الملف (حتى بدون ما يمر ببوابة الدخول) كان يشوفها. هلق محفوظة هون بالسيرفر وبتنرسل
+// بس للأجهزة المعتمدة. مكان الملف: DASHBOARD_SEED_PATH (افتراضيًا /data/dashboard-seed.json على الـvolume)؛ ولو مش موجود
+// هناك بنقرأ نسخة بجانب server.js (dashboard-seed.json) ونبذرها للـvolume أول مرة. تحديث القائمة بدون إعادة نشر:
+// POST /dashboard-seed?admin=<ADMIN_TOKEN> بجسم JSON (مصفوفة).
+const DASHBOARD_SEED_PATH = process.env.DASHBOARD_SEED_PATH || path.join(path.dirname(ACCESS_DATA_PATH), 'dashboard-seed.json');
+const DASHBOARD_SEED_FALLBACK_PATH = path.join(__dirname, 'dashboard-seed.json');
+function loadDashboardSeed() {
+  for (const p of [DASHBOARD_SEED_PATH, DASHBOARD_SEED_FALLBACK_PATH]) {
+    try {
+      const raw = fs.readFileSync(p, 'utf8');
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        if (p !== DASHBOARD_SEED_PATH) { try { fs.mkdirSync(path.dirname(DASHBOARD_SEED_PATH), { recursive: true }); fs.copyFileSync(p, DASHBOARD_SEED_PATH); } catch (_) {} }
+        return arr;
+      }
+    } catch (e) { if (e.code !== 'ENOENT') console.error('[DashboardSeed] read failed:', p, e.message); }
+  }
+  return [];
+}
+app.get('/dashboard-seed', checkAuth, (req, res) => {
+  const deviceParam = (req.query.device || '').toString();
+  const devices = loadDevices();
+  const entry = Object.prototype.hasOwnProperty.call(devices, deviceParam) ? devices[deviceParam] : null;
+  if (!entry || entry.status !== 'approved') return res.status(403).json({ error: 'device-not-approved' });
+  res.set('Cache-Control', 'no-store');
+  res.json(loadDashboardSeed());
+});
+app.post('/dashboard-seed', (req, res) => {
+  if (!ADMIN_TOKEN || !safeTokenEquals(String(req.query.admin || ''), ADMIN_TOKEN)) return res.status(401).json({ error: 'unauthorized' });
+  const arr = req.body;
+  if (!Array.isArray(arr) || arr.length > 20000 || !arr.every(r => r && typeof r === 'object' && typeof r.ref === 'string')) {
+    return res.status(400).json({ error: 'expected an array of {ref,...}' });
+  }
+  try { writeJsonStore(DASHBOARD_SEED_PATH, arr); res.json({ ok: true, count: arr.length }); }
+  catch (e) { console.error('[DashboardSeed] write failed:', e); res.status(500).json({ error: 'write-failed' }); }
 });
 
 // ============================================================================
@@ -1480,7 +1509,7 @@ function notifyOwnerOfSystemIssue(text) {
 app.post('/access/request', async (req, res) => {
   try {
     const { deviceToken, name, adminToken } = req.body || {};
-    if (!deviceToken || typeof deviceToken !== 'string' || deviceToken.length < 8) {
+    if (typeof deviceToken !== 'string' || !/^[A-Za-z0-9_-]{8,128}$/.test(deviceToken)) {
       return res.status(400).json({ error: 'invalid deviceToken' });
     }
     const devices = loadDevices();
@@ -1630,24 +1659,30 @@ app.get('/access/admin', (req, res) => {
 //  مستخدم) - ما منخزن ولا منشوف كلمة المرور الحقيقية أبدًا.
 // ============================================================================
 
-function loadUsers() {
-  try {
-    return JSON.parse(fs.readFileSync(USERS_DATA_PATH, 'utf8'));
-  } catch (e) {
-    return {};
-  }
+function readJsonStore(p) {
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return Object.create(null); throw e; }
+  if (!raw.trim()) return Object.create(null);
+  try { return Object.assign(Object.create(null), JSON.parse(raw)); }
+  catch (e) { try { fs.copyFileSync(p, p + '.corrupt-' + Date.now()); } catch (_) {} throw new Error('store-corrupt: ' + p); }
 }
+function writeJsonStore(p, obj) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const t = p + '.tmp-' + process.pid;
+  fs.writeFileSync(t, JSON.stringify(obj, null, 2));
+  fs.renameSync(t, p);
+}
+function loadUsers() { return readJsonStore(USERS_DATA_PATH); }
 function saveUsers(users) {
   try {
-    fs.mkdirSync(path.dirname(USERS_DATA_PATH), { recursive: true });
-    fs.writeFileSync(USERS_DATA_PATH, JSON.stringify(users, null, 2));
+    writeJsonStore(USERS_DATA_PATH, users);
   } catch (e) {
     console.error('[Users] Failed to save users store:', e);
   }
 }
 function loadSessions() {
   try {
-    return JSON.parse(fs.readFileSync(SESSIONS_DATA_PATH, 'utf8'));
+    return Object.assign(Object.create(null), JSON.parse(fs.readFileSync(SESSIONS_DATA_PATH, 'utf8')));
   } catch (e) {
     return {};
   }
@@ -1703,7 +1738,7 @@ function normalizeUsername(u) {
 const PERMISSION_KEYS = [
   'dashboard', 'dashboardHome',
   'dashKpis', 'dashExpectedPayments', 'dashChart', 'dashLog',
-  'quotation', 'procurement', 'contracts', 'pmp', 'backup', 'files', 'teamSync', 'manageUsers',
+  'quotation', 'quotationsLog', 'procurement', 'contracts', 'payroll', 'clients', 'catalogs', 'pmp', 'backup', 'files', 'teamSync', 'manageUsers',
 ];
 const DEFAULT_PERMISSIONS = {
   dashboard: true,
@@ -1713,6 +1748,10 @@ const DEFAULT_PERMISSIONS = {
   dashChart: true,
   dashLog: true,
   quotation: true,
+  quotationsLog: true,
+  payroll: true,
+  clients: true,
+  catalogs: true,
   procurement: true,
   contracts: true,
   pmp: true,
@@ -1746,7 +1785,7 @@ function publicUser(key, u) {
 function resolveAdmin(req) {
   const adminToken = (req.body && req.body.adminToken) || req.query.adminToken;
   if (adminToken && ADMIN_TOKEN && safeTokenEquals(adminToken, ADMIN_TOKEN)) {
-    return { isOwner: true, username: null };
+    return { isOwner: true, username: null, isFullAdmin: true };
   }
   // جهاز المالك المعتمد (isOwner:true بنظام موافقة الواتساب) - هيك تبويب "المستخدمين" بالداشبورد
   // بيقدر يستخدم مسارات الإدارة بدون ما يحتاج يحمل ADMIN_TOKEN الخام أو ينشئ حساب يوزرنيم/باسوورد.
@@ -1755,20 +1794,20 @@ function resolveAdmin(req) {
     const devices = loadDevices();
     const d = devices[deviceToken];
     if (d && d.isOwner && d.status === 'approved') {
-      return { isOwner: true, username: null };
+      return { isOwner: true, username: null, isFullAdmin: true };
     }
   }
   const token = (req.body && req.body.token) || req.query.token;
   if (token) {
     const sessions = loadSessions();
     const s = sessions[token];
-    if (s) {
+    if (s && Date.now() - (s.createdAt || 0) <= 30 * 24 * 3600 * 1000) {
       const users = loadUsers();
       const u = users[s.username];
       // إما isAdmin (صلاحيات شاملة) أو صلاحية "إدارة المستخدمين" لحالها (تبويب المستخدمين
       // بس، بدون بالضرورة باقي صلاحيات الأدمن الكاملة) - الاثنين بيسمحوا بمسارات إدارة الحسابات.
       if (u && (u.isAdmin || (u.permissions && u.permissions.manageUsers))) {
-        return { isOwner: false, username: s.username };
+        return { isOwner: false, username: s.username, isFullAdmin: !!u.isAdmin };
       }
     }
   }
@@ -1792,7 +1831,7 @@ app.get('/users/status', (req, res) => {
   }
   const users = loadUsers();
   const found = Object.entries(users).find(([, u]) => u.deviceToken === deviceToken);
-  if (!found) return res.json({ hasAccount: false });
+  if (!found || !found[1].passwordHash) return res.json({ hasAccount: false });
   res.json({ hasAccount: true, username: found[1].username || found[0] });
 });
 
@@ -1812,14 +1851,16 @@ app.post('/users/register', (req, res) => {
       return res.status(400).json({ error: 'كلمة المرور لازم تكون 6 أحرف على الأقل' });
     }
     const users = loadUsers();
-    if (users[key]) {
+    const resetEntry = users[key] && !users[key].passwordHash && users[key].deviceToken === deviceToken ? users[key] : null;
+    if (users[key] && !resetEntry) {
       return res.status(409).json({ error: 'اسم المستخدم هاد مستخدم من حدا تاني - اختار اسم مختلف' });
     }
-    const existingForDevice = Object.entries(users).find(([, u]) => u.deviceToken === deviceToken);
+    const existingForDevice = Object.entries(users).find(([k, u]) => u.deviceToken === deviceToken && !(resetEntry && k === key));
     if (existingForDevice) {
       return res.status(409).json({ error: 'هالجهاز عنده حساب مسجّل مسبقًا - جرب تسجيل الدخول بدل إنشاء حساب جديد' });
     }
-    users[key] = {
+    if (resetEntry) { resetEntry.passwordHash = hashPassword(password); }
+    else users[key] = {
       username: String(username).trim(),
       passwordHash: hashPassword(password),
       permissions: Object.assign({}, DEFAULT_PERMISSIONS),
@@ -1840,15 +1881,34 @@ app.post('/users/register', (req, res) => {
   }
 });
 
-app.post('/users/login', (req, res) => {
+const loginFails = new Map();
+const DUMMY_HASH = hashPassword('dummy-password-for-timing');
+function verifyPasswordAsync(password, stored) {
+  return new Promise((resolve) => {
+    try {
+      const [salt, hash] = String(stored).split(':');
+      const hb = Buffer.from(hash, 'hex');
+      crypto.scrypt(String(password), salt, 64, (err, dk) => resolve(!err && dk.length === hb.length && crypto.timingSafeEqual(dk, hb)));
+    } catch (e) { resolve(false); }
+  });
+}
+app.post('/users/login', async (req, res) => {
   try {
     const { username, password } = req.body || {};
     const key = normalizeUsername(username);
+    const rlKey = req.socket.remoteAddress + '|' + key;
+    if (loginFails.size > 10000) loginFails.clear();
+    const rec = loginFails.get(rlKey) || { n: 0, t: Date.now() };
+    if (Date.now() - rec.t > 15 * 60 * 1000) { rec.n = 0; rec.t = Date.now(); }
+    if (rec.n >= 5) return res.status(429).json({ error: 'too many attempts, try again later' });
     const users = loadUsers();
     const u = users[key];
-    if (!u || !u.passwordHash || !verifyPassword(password, u.passwordHash)) {
+    const ok = await verifyPasswordAsync(password, (u && u.passwordHash) || DUMMY_HASH);
+    if (!u || !u.passwordHash || !ok) {
+      rec.n++; loginFails.set(rlKey, rec);
       return res.status(401).json({ error: 'اسم المستخدم أو كلمة المرور غير صحيحة' });
     }
+    loginFails.delete(rlKey);
     const token = newSessionToken();
     const sessions = loadSessions();
     sessions[token] = { username: key, createdAt: Date.now() };
@@ -1864,7 +1924,7 @@ app.get('/users/me', (req, res) => {
   const token = (req.query.token || '').toString();
   const sessions = loadSessions();
   const s = sessions[token];
-  if (!s) return res.status(401).json({ error: 'invalid session' });
+  if (!s || Date.now() - (s.createdAt || 0) > 30 * 24 * 3600 * 1000) return res.status(401).json({ error: 'invalid session' });
   const users = loadUsers();
   const u = users[s.username];
   if (!u) return res.status(401).json({ error: 'invalid session' });
@@ -1909,6 +1969,9 @@ app.post('/users/permissions', (req, res) => {
   const users = loadUsers();
   const u = users[key];
   if (!u) return res.status(404).json({ error: 'user not found' });
+  if (!admin.isFullAdmin && (typeof isAdmin === 'boolean' || u.isAdmin || (permissions && typeof permissions.manageUsers === 'boolean'))) {
+    return res.status(403).json({ error: 'only a full admin can change admin/manageUsers rights' });
+  }
   u.permissions = sanitizePermissions(permissions, u.permissions);
   if (typeof isAdmin === 'boolean') u.isAdmin = isAdmin;
   users[key] = u;
