@@ -284,11 +284,19 @@ function cleanupStaleChromeLocks(rootDir) {
 }
 
 function checkAuth(req, res, next) {
-  const token = req.headers['x-api-key'] || req.query.token;
-  if (!AUTH_TOKEN || token !== AUTH_TOKEN) {
-    return res.status(401).json({ error: 'unauthorized' });
+  // الطريقة الجديدة: توكن الجهاز المعتمد (x-device أو ?device=) - خاص بكل جهاز وبينسحب من صفحة المستخدمين/الأجهزة.
+  const dev = req.headers['x-device'] || req.query.device;
+  if (typeof dev === 'string' && dev) {
+    try {
+      const devices = loadDevices();
+      const entry = Object.prototype.hasOwnProperty.call(devices, dev) ? devices[dev] : null;
+      if (entry && entry.status === 'approved') return next();
+    } catch (e) { console.error('[Auth] device lookup failed:', e.message); }
   }
-  next();
+  // الطريقة القديمة (AUTH_TOKEN المشترك) لسا مقبولة بس لحد ما تغيّر قيمة AUTH_TOKEN على Railway - بعدها بتبطل تنفع.
+  const token = req.headers['x-api-key'] || req.query.token;
+  if (AUTH_TOKEN && token === AUTH_TOKEN) return next();
+  return res.status(401).json({ error: 'unauthorized' });
 }
 
 // Simple abuse protection: cap at 30 messages per hour.
