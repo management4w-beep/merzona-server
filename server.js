@@ -657,6 +657,34 @@ app.post('/dashboard-seed', (req, res) => {
   catch (e) { console.error('[DashboardSeed] write failed:', e); res.status(500).json({ error: 'write-failed' }); }
 });
 
+// صفحة رفع بسيطة (للمالك فقط): افتح /dashboard-seed/upload?admin=<ADMIN_TOKEN> من المتصفح، اختار ملف dashboard-seed.json واضغط رفع.
+app.get('/dashboard-seed/upload', (req, res) => {
+  if (!ADMIN_TOKEN || !safeTokenEquals(String(req.query.admin || ''), ADMIN_TOKEN)) {
+    return res.status(401).send('<h2 style="font-family:sans-serif">غير مصرح - Unauthorized</h2>');
+  }
+  let current = 0; try { current = loadDashboardSeed().length; } catch (_) {}
+  const adminJs = JSON.stringify(String(req.query.admin)).replace(/</g, '\\u003c');
+  res.set('Cache-Control', 'no-store').type('html').send(`<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>رفع قائمة العروض</title></head>
+<body style="font-family:sans-serif;max-width:520px;margin:40px auto;padding:0 16px">
+<h2>رفع قائمة عروض الداشبورد</h2>
+<p>عدد العروض المحفوظة حاليًا على السيرفر: <b>${current}</b></p>
+<input type="file" id="f" accept=".json,application/json"><br><br>
+<button id="b" style="padding:10px 18px;font-size:16px">رفع</button>
+<p id="m" style="font-weight:bold"></p>
+<script>
+document.getElementById('b').onclick = async function(){
+  var m = document.getElementById('m'); var f = document.getElementById('f').files[0];
+  if(!f){ m.textContent = 'اختار الملف أول'; return; }
+  try{
+    var data = JSON.parse(await f.text());
+    var r = await fetch('/dashboard-seed?admin=' + encodeURIComponent(${adminJs}), { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+    var j = await r.json().catch(function(){return {};});
+    m.textContent = r.ok ? ('تم الرفع ✓ عدد العروض: ' + j.count) : ('فشل الرفع: ' + (j.error || r.status));
+  }catch(e){ m.textContent = 'الملف مو صحيح: ' + e.message; }
+};
+</script></body></html>`);
+});
+
 // ============================================================================
 //  Electronic contract signing (client-facing, no login required)
 //  ------------------------------------------------------------------------
