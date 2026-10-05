@@ -653,6 +653,14 @@ app.post('/dashboard-seed', (req, res) => {
   if (!Array.isArray(arr) || arr.length > 20000 || !arr.every(r => r && typeof r === 'object' && typeof r.ref === 'string')) {
     return res.status(400).json({ error: 'expected an array of {ref,...}' });
   }
+  // حماية من الكتابة بالغلط: ما منسمح بقائمة أقل بكتير من الحالية إلا بـ ?force=1، ومنحتفظ بنسخة قبل أي استبدال.
+  try {
+    const existing = loadDashboardSeed();
+    if (existing.length >= 20 && arr.length < existing.length * 0.5 && req.query.force !== '1') {
+      return res.status(409).json({ error: 'would-shrink-list', existing: existing.length, incoming: arr.length, hint: 'add ?force=1 if intentional' });
+    }
+    if (existing.length) { try { fs.copyFileSync(DASHBOARD_SEED_PATH, DASHBOARD_SEED_PATH + '.prev'); } catch (_) {} }
+  } catch (_) {}
   try { writeJsonStore(DASHBOARD_SEED_PATH, arr); res.json({ ok: true, count: arr.length }); }
   catch (e) { console.error('[DashboardSeed] write failed:', e); res.status(500).json({ error: 'write-failed' }); }
 });
@@ -2056,5 +2064,54 @@ app.post('/users/delete', (req, res) => {
   }
   res.json({ ok: true });
 });
+
+// ───────────────────────── نسخ احتياطي تلقائي + تسجيل أخطاء ─────────────────────────
+// منسخ الملفات الصغيرة المهمة بس (مو جلسة الواتس اب لأنها كبيرة وبتتجدد من QR) على نفس الـVolume،
+// نسخة لكل يوم، ومنحتفظ بآخر 30 يوم. بيشتغل عند التشغيل وكل 6 ساعات.
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(ACCESS_DATA_PATH), 'backups');
+const BACKUP_KEEP_DAYS = parseInt(process.env.BACKUP_KEEP_DAYS || '30', 10);
+const BACKUP_FILES = [ACCESS_DATA_PATH, USERS_DATA_PATH, SESSIONS_DATA_PATH, DASHBOARD_SEED_PATH, GOOGLE_REFRESH_TOKEN_PATH];
+let lastBackupInfo = { at: null, files: 0, ok: null, error: null };
+function runBackup() {
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    const dest = path.join(BACKUP_DIR, day);
+    fs.mkdirSync(dest, { recursive: true });
+    let n = 0;
+    for (const f of BACKUP_FILES) {
+      try {
+        if (!fs.existsSync(f)) continue;
+        const raw = fs.readFileSync(f, 'utf8');
+        if (!raw.trim()) continue;
+        if (f.endsWith('.json')) JSON.parse(raw); // ما منحفظ ملف تالف مكان نسخة سليمة
+        const target = path.join(dest, path.basename(f));
+        fs.writeFileSync(target + '.tmp', raw);
+        fs.renameSync(target + '.tmp', target);
+        n++;
+      } catch (e) { console.error('[Backup] skipped', f, e.message); }
+    }
+    const days = fs.readdirSync(BACKUP_DIR).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+    while (days.length > BACKUP_KEEP_DAYS) {
+      const old = path.join(BACKUP_DIR, days.shift());
+      try { for (const x of fs.readdirSync(old)) fs.unlinkSync(path.join(old, x)); fs.rmdirSync(old); } catch (_) {}
+    }
+    lastBackupInfo = { at: new Date().toISOString(), files: n, ok: true, error: null };
+    console.log('[Backup] ok -', day, n, 'files');
+  } catch (e) {
+    lastBackupInfo = { at: new Date().toISOString(), files: 0, ok: false, error: e.message };
+    console.error('[Backup] FAILED:', e.message);
+  }
+}
+setTimeout(runBackup, 20 * 1000);
+setInterval(runBackup, 6 * 60 * 60 * 1000).unref();
+app.get('/backup/status', checkAuth, (req, res) => {
+  let days = [];
+  try { days = fs.readdirSync(BACKUP_DIR).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort(); } catch (_) {}
+  res.json({ ok: true, last: lastBackupInfo, days, keepDays: BACKUP_KEEP_DAYS });
+});
+// أي خطأ غير ممسوك بينسجّل بدل ما يطيّح السيرفر بصمت.
+process.on('unhandledRejection', (r) => console.error('[UnhandledRejection]', r && r.stack ? r.stack : r));
+process.on('uncaughtException', (e) => console.error('[UncaughtException]', e && e.stack ? e.stack : e));
+
 
 app.listen(PORT, () => console.log(`[Server] Running on port ${PORT}`));
