@@ -136,6 +136,7 @@ let client = null;
 // جديد؛ لو هاي المحاولة نفسها علّقت 60 ثانية كمان، شبكة الأمان فوق بتاخد القرار وتمسح وتعيد).
 let whatsappInitAttempts = 0;
 const MAX_AUTO_HEAL_ATTEMPTS = 2;
+let waLastRestartReason = null, waLastDisconnectReason = null, waReadyAt = null, waStartedAt = Date.now(), waBadStateChecks = 0;
 let whatsappCycleId = 0;
 let cycleResolvedFlag = false;
 
@@ -150,7 +151,7 @@ function buildWhatsAppClient() {
       // default image, which crashes with "error while loading shared libraries: libglib-2.0...".
       // Falls back to the bundled Chromium (undefined = default) when this isn't set, e.g. locally.
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-extensions', '--mute-audio', '--no-first-run', '--disable-background-networking'],
     },
     // 🔧 2026-08-26: شلنا تثبيت نسخة WhatsApp Web على ملف محدد بمستودع خارجي (كان هون قبل).
     // السبب: هيك مصادر (raw.githubusercontent.com/wppconnect-team/wa-version) بتشيل/بتغيّر أسماء
@@ -181,8 +182,10 @@ function wireClientEvents(c) {
   });
   c.on('ready', () => {
     clientReady = true;
+    waReadyAt = Date.now(); waBadStateChecks = 0;
     lastQr = null;
     cycleResolvedFlag = true;
+    setTimeout(() => { try { flushWhatsAppOutbox(); } catch (e) {} }, 3000);
     whatsappInitAttempts = 0; // نجح الاتصال - أي تعليق لاحق مستقبلاً بيتعامل معه من الصفر كمشكلة جديدة
     console.log('[WhatsApp] Login successful ✅ - the server is ready to send messages.');
   });
@@ -192,6 +195,7 @@ function wireClientEvents(c) {
   });
   c.on('disconnected', (reason) => {
     clientReady = false;
+    waLastDisconnectReason = String(reason); waLastRestartReason = 'disconnected';
     console.warn('[WhatsApp] Disconnected:', reason, '- عم نعيد تشغيل الاتصال تلقائيًا...');
     startWhatsAppClient();
   });
@@ -230,22 +234,27 @@ function startWhatsAppClient() {
     console.error('[WhatsApp] initialize() فشلت:', e);
   });
 
-  // شبكة الأمان: إذا خلص 60 ثانية وما صار ready ولا طلع QR بهالدورة تحديدًا (myCycle) - دليل قوي
-  // إنو في تعليق (hang) بالجلسة المحفوظة. منمسحها ومنعيد المحاولة تلقائيًا، لحد MAX_AUTO_HEAL_ATTEMPTS.
+  // شبكة الأمان (معدّلة 2026-10-07): الـ60 ثانية القديمة كانت قصيرة جدًا - تحميل واتساب ويب بكروميوم على Railway
+  // ممكن ياخد أكتر من دقيقة بالوضع الطبيعي، وكانت تحسبه "تعليق" وتمسح الجلسة السليمة (فبتضطر تمسح QR كل مرة).
+  // هلق: نستنى 150 ثانية، وأول محاولتين إعادة تشغيل *بدون* مسح الجلسة، ومنمسحها بس بالمحاولة التالتة.
   setTimeout(() => {
-    if (myCycle !== whatsappCycleId) return; // صار في دورة أحدث (مثلاً بسبب disconnected) - هالمؤقّت صار قديم، تجاهله
+    if (myCycle !== whatsappCycleId) return; // صار في دورة أحدث - هالمؤقّت صار قديم، تجاهله
     if (!cycleResolvedFlag) {
       whatsappInitAttempts++;
+      waLastRestartReason = 'init-timeout-' + whatsappInitAttempts;
+      try { client.destroy().catch(() => {}); } catch (e) {}
       if (whatsappInitAttempts <= MAX_AUTO_HEAL_ATTEMPTS) {
-        console.warn('[WhatsApp] ⚠️ مرت 60 ثانية وما صار ready وما طلع QR (محاولة إصلاح تلقائي ' + whatsappInitAttempts + '/' + MAX_AUTO_HEAL_ATTEMPTS + ') - غالبًا الجلسة المحفوظة تالفة أو عالقة بالتحميل. عم نمسحها ونعيد المحاولة بجلسة نظيفة...');
-        try { client.destroy().catch(() => {}); } catch (e) {}
+        console.warn('[WhatsApp] ⚠️ مرت 150 ثانية وما صار ready وما طلع QR (إعادة تشغيل بدون مسح الجلسة ' + whatsappInitAttempts + '/' + MAX_AUTO_HEAL_ATTEMPTS + ')');
+        startWhatsAppClient();
+      } else if (whatsappInitAttempts === MAX_AUTO_HEAL_ATTEMPTS + 1) {
+        console.warn('[WhatsApp] ⚠️ فشلت إعادة التشغيل العادية - رح نمسح الجلسة المحفوظة ونبدأ جلسة نظيفة (بدك تمسح QR جديد من /qr)');
         wipeWhatsAppAuthSession();
         startWhatsAppClient();
       } else {
-        console.error('[WhatsApp] ❌ استمرت المشكلة بعد ' + MAX_AUTO_HEAL_ATTEMPTS + ' محاولات إصلاح تلقائي - المشكلة أعمق من مجرد جلسة تالفة (شبكة/كروميوم مثلاً). لازم مراجعة يدوية للـDeploy Logs.');
+        console.error('[WhatsApp] ❌ استمرت المشكلة بعد كل المحاولات التلقائية - غالبًا مشكلة ذاكرة/كروميوم بالسيرفر. شوف /whatsapp-status وسطور [WhatsApp] باللوغ.');
       }
     }
-  }, 60000);
+  }, 150000);
 }
 
 startWhatsAppClient();
@@ -388,7 +397,6 @@ app.get('/last-messages', checkAuth, (req, res) => {
 
 // Main route: called automatically by the quotation tool on every save.
 app.post('/send-quotation', checkAuth, async (req, res) => {
-  if (!clientReady) return res.status(503).json({ error: 'whatsapp client not ready yet' });
   if (!GROUP_ID) return res.status(500).json({ error: 'GROUP_ID not set on the server - see README.md' });
   if (isRateLimited()) return res.status(429).json({ error: 'rate limit exceeded' });
 
@@ -396,94 +404,178 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
   if (!Array.isArray(items) || !items.length) {
     return res.status(400).json({ error: 'no items provided' });
   }
+  const payload = { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename, createdBy };
 
-  // 🔧 إصلاح 2026-08-25: نرد على المتصفح فورًا هون (بعد التحقق من صحة البيانات بس)، قبل
-  // ما نبعت فعليًا عبر واتساب. سبب الإصلاح: client.sendMessage() مع مرفق PDF عبر
-  // whatsapp-web.js ممكن ياخد كذا ثانية (بتفتح/تتحكم بمتصفح داخلي)، وإذا تخطينا مهلة
-  // الاتصال (سواء عند Railway أو بالمتصفح نفسه)، الاتصال بينقطع قبل ما يوصل الرد -
-  // والمتصفح بيسجلها غلط كأنها مشكلة CORS ("Failed to fetch") رغم إنو غالبًا الرسالة
-  // نفسها بتكون انبعتت أو بتنبعث لاحقًا. هلق منرد فورًا ومنكمل الإرسال الفعلي بالخلفية،
-  // ومنسجل أي فشل حقيقي بلوغ السيرفر (Railway logs) بدل ما نخلي المتصفح ينتظره.
-  res.json({ ok: true, queued: true });
-
+  // 🆕 2026-10-07 (طلب حمدي: حل جذري للواتس اب): لو الواتس اب مفصول هلأ، ما منرفض الطلب (كانت الرسالة تضيع)؛
+  // منخزّنها بطابور دائم على الـVolume وبتنبعت لحالها أول ما يرجع الاتصال. نفس الشي لو الإرسال نفسه فشل.
+  res.json({ ok: true, queued: true, delayed: !clientReady });
   (async () => {
+    if (!clientReady) {
+      enqueueWhatsAppOutbox('quotation', payload);
+      console.warn('[WhatsApp] الواتس اب مفصول - انحفظ عرض السعر بالطابور (' + (ref || 'بدون مرجع') + ') وبينبعت أول ما يرجع الاتصال.');
+      return;
+    }
     try {
-      // NOTE: the outgoing WhatsApp message text below is in Arabic on purpose,
-      // since that's the language of the "Tasks" group / the team reading it.
-      // Only this file's comments and API responses were translated to English.
-      let msg = '📋 *عرض سعر جديد - Merzona*\n';
-      // 🆕 2026-08-27: لف رقم المرجع بعلامات LTR isolate (⁦...⁩) عشان ما ينعكس ترتيبه
-      // بصفحات/تطبيقات تعرض النص بالاتجاه الثنائي (bidi) - نفس النمط المستخدم بمكان تاني بالمشروع.
-      if (ref) msg += `المرجع: ⁦${ref}⁩\n`;
-      if (clientName) msg += `العميل: ${clientName}\n`;
-      if (location) msg += `الإمارة: ${location}\n`;
-      if (mobile) msg += `الموبايل: ${mobile}\n`;
-      // 🆕 2026-08-26: اسم الشخص يلي أنشأ عرض السعر (من حساب المستخدم تبعو) - سطر اختياري، بيظهر
-      // بس لو الأداة بعتت اسم فعلي (مثلاً المالك عن طريق رابط #owner= ما إلو حساب فما بيظهر السطر).
-      if (createdBy) msg += `تم إنشاؤه بواسطة: ${createdBy}\n`;
-      msg += '\n*البنود:*\n';
-
-      // Group identical items (same name + same price/m²) into one line and sum their
-      // quantity - dimensions are intentionally left out of the message entirely. An item
-      // only appears as a separate line when a DIFFERENT price was set for a similar name.
-      const grouped = new Map();
-      items.forEach((it) => {
-        const name = (it.name || '').toString().trim();
-        if (!name) return;
-        const price = (it.pricePerM2 || '').toString().trim();
-        const key = name.toLowerCase() + '||' + price;
-        const qty = parseFloat(it.qty) || 1;
-        if (grouped.has(key)) {
-          grouped.get(key).qty += qty;
-        } else {
-          grouped.set(key, { name, price, qty });
-        }
-      });
-      let lineNo = 0;
-      for (const g of grouped.values()) {
-        lineNo++;
-        const qtyTxt = g.qty ? `×${g.qty}` : '';
-        const priceTxt = g.price ? `${g.price} AED/m²` : '';
-        const parts = [g.name, qtyTxt, priceTxt].filter(Boolean);
-        msg += `${lineNo}. ${parts.join(' - ')}\n`;
-      }
-      if (grandTotal) msg += `\n*الإجمالي: ${grandTotal} AED*`;
-
-      // Attach the quotation PDF itself when the tool sent one along - falls back to a
-      // plain text message (still useful) if the PDF is missing or fails to attach for
-      // any reason, so a PDF problem never blocks the notification from going out.
-      // 🆕 2026-09-29 (طلب/ملاحظة حمدي: الرسالة وصلت بس بدون مرفق PDF) - فحصنا اللوغ ولقينا الخطأ
-      // الحقيقي: "Data passed to getter must include an id property... but got undefined" - هاد خطأ
-      // معروف ومتكرر بمكتبة whatsapp-web.js لما بيصير إرسال مرفق (media) لمجموعة/محادثة قبل ما تخلص
-      // صفحة واتساب ويب الداخلية (Puppeteer) تحمّل/تخزّن بيانات هاي المحادثة بالكامل بذاكرتها -
-      // بيصير غالبًا أول رسالة مرفق بعد تسجيل دخول جديد (QR) أو بعد إعادة تشغيل السيرفر، وبيزول لحاله
-      // خلال ثواني قليلة. فبدل ما نستسلم فورًا للنص بس، منعيد المحاولة مرة وحدة بعد مهلة قصيرة (4
-      // ثواني) قبل ما نرجع للنص بس - هيك أغلب الحالات (تحديدًا هاي بالذات) بتنحل تلقائيًا بمحاولة تانية.
-      if (pdfBase64) {
-        const media = new MessageMedia('application/pdf', pdfBase64, (pdfFilename || 'quotation.pdf').toString());
-        try {
-          await client.sendMessage(GROUP_ID, media, { caption: msg });
-        } catch (mediaErr) {
-          console.warn('[WhatsApp] ⚠️ فشلت أول محاولة لإرفاق PDF (رح نعيد المحاولة بعد 4 ثواني):', mediaErr);
-          await new Promise((resolve) => setTimeout(resolve, 4000));
-          try {
-            await client.sendMessage(GROUP_ID, media, { caption: msg });
-            console.log('[WhatsApp] ✅ نجحت المحاولة الثانية لإرفاق PDF.');
-          } catch (mediaErr2) {
-            console.error('[WhatsApp] ❌ فشلت المحاولة الثانية كمان - رح تنبعت الرسالة كنص بس بدون مرفق:', mediaErr2);
-            await client.sendMessage(GROUP_ID, msg);
-          }
-        }
-      } else {
-        await client.sendMessage(GROUP_ID, msg);
-      }
-
+      await deliverQuotation(payload);
       sendLog.push(Date.now());
       console.log('[WhatsApp] ✅ تم إرسال عرض السعر بنجاح (بالخلفية) - المرجع:', ref || '(بدون مرجع)');
     } catch (e) {
-      console.error('[WhatsApp] Failed to send message (background):', e);
+      console.error('[WhatsApp] Failed to send message (background) - انحفظ بالطابور لإعادة المحاولة:', e);
+      enqueueWhatsAppOutbox('quotation', payload);
     }
   })();
+});
+
+// بتبني رسالة عرض السعر وبتبعتها (مع PDF لو موجود). بترمي خطأ لو فشل الإرسال نهائيًا (حتى بعد الرجوع لنص بدون مرفق).
+async function deliverQuotation(p) {
+  const { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename, createdBy } = p;
+  // NOTE: the outgoing WhatsApp message text below is in Arabic on purpose,
+  // since that's the language of the "Tasks" group / the team reading it.
+  // Only this file's comments and API responses were translated to English.
+  let msg = '📋 *عرض سعر جديد - Merzona*\n';
+  // 🆕 2026-08-27: لف رقم المرجع بعلامات LTR isolate (⁦...⁩) عشان ما ينعكس ترتيبه
+  // بصفحات/تطبيقات تعرض النص بالاتجاه الثنائي (bidi) - نفس النمط المستخدم بمكان تاني بالمشروع.
+  if (ref) msg += `المرجع: ⁦${ref}⁩\n`;
+  if (clientName) msg += `العميل: ${clientName}\n`;
+  if (location) msg += `الإمارة: ${location}\n`;
+  if (mobile) msg += `الموبايل: ${mobile}\n`;
+  // 🆕 2026-08-26: اسم الشخص يلي أنشأ عرض السعر (من حساب المستخدم تبعو) - سطر اختياري، بيظهر
+  // بس لو الأداة بعتت اسم فعلي (مثلاً المالك عن طريق رابط #owner= ما إلو حساب فما بيظهر السطر).
+  if (createdBy) msg += `تم إنشاؤه بواسطة: ${createdBy}\n`;
+  msg += '\n*البنود:*\n';
+
+  // Group identical items (same name + same price/m²) into one line and sum their
+  // quantity - dimensions are intentionally left out of the message entirely. An item
+  // only appears as a separate line when a DIFFERENT price was set for a similar name.
+  const grouped = new Map();
+  items.forEach((it) => {
+    const name = (it.name || '').toString().trim();
+    if (!name) return;
+    const price = (it.pricePerM2 || '').toString().trim();
+    const key = name.toLowerCase() + '||' + price;
+    const qty = parseFloat(it.qty) || 1;
+    if (grouped.has(key)) {
+      grouped.get(key).qty += qty;
+    } else {
+      grouped.set(key, { name, price, qty });
+    }
+  });
+  let lineNo = 0;
+  for (const g of grouped.values()) {
+    lineNo++;
+    const qtyTxt = g.qty ? `×${g.qty}` : '';
+    const priceTxt = g.price ? `${g.price} AED/m²` : '';
+    const parts = [g.name, qtyTxt, priceTxt].filter(Boolean);
+    msg += `${lineNo}. ${parts.join(' - ')}\n`;
+  }
+  if (grandTotal) msg += `\n*الإجمالي: ${grandTotal} AED*`;
+
+  // Attach the quotation PDF itself when the tool sent one along - falls back to a
+  // plain text message (still useful) if the PDF is missing or fails to attach for
+  // any reason, so a PDF problem never blocks the notification from going out.
+  // 🆕 2026-09-29 (طلب/ملاحظة حمدي: الرسالة وصلت بس بدون مرفق PDF) - فحصنا اللوغ ولقينا الخطأ
+  // الحقيقي: "Data passed to getter must include an id property... but got undefined" - هاد خطأ
+  // معروف ومتكرر بمكتبة whatsapp-web.js لما بيصير إرسال مرفق (media) لمجموعة/محادثة قبل ما تخلص
+  // صفحة واتساب ويب الداخلية (Puppeteer) تحمّل/تخزّن بيانات هاي المحادثة بالكامل بذاكرتها -
+  // بيصير غالبًا أول رسالة مرفق بعد تسجيل دخول جديد (QR) أو بعد إعادة تشغيل السيرفر، وبيزول لحاله
+  // خلال ثواني قليلة. فبدل ما نستسلم فورًا للنص بس، منعيد المحاولة مرة وحدة بعد مهلة قصيرة (4
+  // ثواني) قبل ما نرجع للنص بس - هيك أغلب الحالات (تحديدًا هاي بالذات) بتنحل تلقائيًا بمحاولة تانية.
+  if (pdfBase64) {
+    const media = new MessageMedia('application/pdf', pdfBase64, (pdfFilename || 'quotation.pdf').toString());
+    try {
+      await client.sendMessage(GROUP_ID, media, { caption: msg });
+    } catch (mediaErr) {
+      console.warn('[WhatsApp] ⚠️ فشلت أول محاولة لإرفاق PDF (رح نعيد المحاولة بعد 4 ثواني):', mediaErr);
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+      try {
+        await client.sendMessage(GROUP_ID, media, { caption: msg });
+        console.log('[WhatsApp] ✅ نجحت المحاولة الثانية لإرفاق PDF.');
+      } catch (mediaErr2) {
+        console.error('[WhatsApp] ❌ فشلت المحاولة الثانية كمان - رح تنبعت الرسالة كنص بس بدون مرفق:', mediaErr2);
+        await client.sendMessage(GROUP_ID, msg);
+      }
+    }
+  } else {
+    await client.sendMessage(GROUP_ID, msg);
+  }
+}
+
+// ───────── طابور الرسائل الدائم (Outbox) ─────────
+// بيحفظ الرسائل اللي ما قدرنا نبعتها لأن الواتس اب مفصول/فشل الإرسال، على نفس الـVolume، وبيعيد إرسالها بالترتيب.
+const OUTBOX_PATH = process.env.WA_OUTBOX_PATH || path.join(path.dirname(ACCESS_DATA_PATH), 'whatsapp-outbox.json');
+const OUTBOX_MAX_JOBS = 100, OUTBOX_MAX_ATTEMPTS = 15, OUTBOX_MAX_AGE_MS = 3 * 24 * 3600 * 1000, OUTBOX_MAX_PDF_B64 = 6 * 1024 * 1024;
+let outboxFlushing = false;
+function loadOutbox() { try { const a = JSON.parse(fs.readFileSync(OUTBOX_PATH, 'utf8')); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
+function saveOutbox(a) { try { fs.mkdirSync(path.dirname(OUTBOX_PATH), { recursive: true }); const t = OUTBOX_PATH + '.tmp'; fs.writeFileSync(t, JSON.stringify(a)); fs.renameSync(t, OUTBOX_PATH); } catch (e) { console.error('[Outbox] save failed:', e.message); } }
+function enqueueWhatsAppOutbox(kind, payload) {
+  const jobs = loadOutbox();
+  const p = Object.assign({}, payload);
+  if (p.pdfBase64 && p.pdfBase64.length > OUTBOX_MAX_PDF_B64) { delete p.pdfBase64; p.pdfDropped = true; } // PDF ضخم جدًا: بنخزّن النص بس
+  jobs.push({ id: Date.now() + '-' + Math.random().toString(36).slice(2, 8), kind, payload: p, attempts: 0, createdAt: Date.now() });
+  while (jobs.length > OUTBOX_MAX_JOBS) jobs.shift();
+  saveOutbox(jobs);
+}
+async function flushWhatsAppOutbox() {
+  if (outboxFlushing || !clientReady) return;
+  outboxFlushing = true;
+  try {
+    let jobs = loadOutbox();
+    const now = Date.now();
+    jobs = jobs.filter(j => now - j.createdAt < OUTBOX_MAX_AGE_MS && j.attempts < OUTBOX_MAX_ATTEMPTS);
+    while (jobs.length && clientReady) {
+      const job = jobs[0];
+      try {
+        if (job.kind === 'quotation') await deliverQuotation(job.payload);
+        else { jobs.shift(); continue; }
+        jobs.shift(); saveOutbox(jobs);
+        console.log('[Outbox] ✅ انبعتت رسالة من الطابور:', job.payload && job.payload.ref);
+        await new Promise(r => setTimeout(r, 2500)); // مهلة بين الرسائل
+      } catch (e) {
+        job.attempts++; saveOutbox(jobs);
+        console.error('[Outbox] فشلت إعادة الإرسال (محاولة ' + job.attempts + '):', e && e.message);
+        break; // منوقف ونعيد بالدورة الجاية
+      }
+    }
+    saveOutbox(jobs);
+  } finally { outboxFlushing = false; }
+}
+setInterval(() => { flushWhatsAppOutbox().catch(() => {}); }, 60 * 1000).unref();
+
+// ───────── مراقب صحة الواتس اب (Watchdog) + صفحة الحالة ─────────
+// كل دقيقة: لو كان "جاهز" بس حالته الفعلية مو CONNECTED 3 مرات ورا بعض، أو ما صار جاهز ولا طلع QR لأكتر من 5 دقايق،
+// منعيد تشغيل الاتصال تلقائيًا (بدون مسح الجلسة).
+setInterval(async () => {
+  try {
+    if (clientReady && client) {
+      let state = null;
+      try { state = await Promise.race([client.getState(), new Promise((_, rej) => setTimeout(() => rej(new Error('state-timeout')), 20000))]); } catch (e) { state = 'ERR:' + e.message; }
+      if (state === 'CONNECTED') { waBadStateChecks = 0; return; }
+      waBadStateChecks++;
+      console.warn('[Watchdog] حالة الواتس اب غير سليمة (' + state + ') - مرة ' + waBadStateChecks + '/3');
+      if (waBadStateChecks >= 3) {
+        waBadStateChecks = 0; clientReady = false; waLastRestartReason = 'watchdog:' + state;
+        try { await client.destroy(); } catch (_) {}
+        startWhatsAppClient();
+      }
+    } else if (!clientReady && !lastQr && Date.now() - waStartedAt > 5 * 60 * 1000 && waReadyAt === null && whatsappInitAttempts > MAX_AUTO_HEAL_ATTEMPTS + 1) {
+      // استنفدنا المحاولات التلقائية بدون أي تقدّم: محاولة أخيرة كل 10 دقايق بدل ما نضل واقفين للأبد
+      if (!global.__waLastWatchdogRetry || Date.now() - global.__waLastWatchdogRetry > 10 * 60 * 1000) {
+        global.__waLastWatchdogRetry = Date.now(); whatsappInitAttempts = 0; waLastRestartReason = 'watchdog-retry';
+        try { await client.destroy(); } catch (_) {}
+        startWhatsAppClient();
+      }
+    }
+  } catch (e) { console.error('[Watchdog] error:', e.message); }
+}, 60 * 1000).unref();
+app.get('/whatsapp-status', (req, res) => {
+  const mem = process.memoryUsage();
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    ready: clientReady, qrWaiting: !!lastQr, uptimeMin: Math.round((Date.now() - waStartedAt) / 60000),
+    readyForMin: waReadyAt && clientReady ? Math.round((Date.now() - waReadyAt) / 60000) : null,
+    initAttempts: whatsappInitAttempts, lastRestartReason: waLastRestartReason, lastDisconnectReason: waLastDisconnectReason,
+    outboxPending: loadOutbox().length, rssMB: Math.round(mem.rss / 1048576), authFolderExists: fs.existsSync(AUTH_DATA_PATH)
+  });
 });
 
 // ============================================================================
@@ -2120,6 +2212,73 @@ app.get('/backup/status', checkAuth, (req, res) => {
 // أي خطأ غير ممسوك بينسجّل بدل ما يطيّح السيرفر بصمت.
 process.on('unhandledRejection', (r) => console.error('[UnhandledRejection]', r && r.stack ? r.stack : r));
 process.on('uncaughtException', (e) => console.error('[UncaughtException]', e && e.stack ? e.stack : e));
+
+
+// ───────────────────────── تسجيل أخطاء الصفحات (client errors) ─────────────────────────
+// كل صفحة (عرض السعر/الداشبورد/المشتريات) بتبعت أي خطأ جافاسكربت بيصير عند أي مستخدم لهون (من جهاز معتمد بس).
+// بنخزنهم بملف على الـVolume، وبتشوفهم مجمّعين من: /client-errors?admin=<ADMIN_TOKEN> (أضف &json=1 للنسخة الخام).
+const CLIENT_ERRORS_PATH = process.env.CLIENT_ERRORS_PATH || path.join(path.dirname(ACCESS_DATA_PATH), 'client-errors.jsonl');
+const CLIENT_ERRORS_MAX_BYTES = 2 * 1024 * 1024;
+const clientErrRate = new Map(); // device -> [timestamps]
+function clientErrRateLimited(dev) {
+  const now = Date.now();
+  const arr = (clientErrRate.get(dev) || []).filter(t => now - t < 3600 * 1000);
+  if (arr.length >= 60) { clientErrRate.set(dev, arr); return true; }
+  arr.push(now); clientErrRate.set(dev, arr); return false;
+}
+function recordClientError(body, dev) {
+  const str = (v, n) => (typeof v === 'string' ? v : (v == null ? '' : String(v))).slice(0, n);
+  const rec = {
+    at: new Date().toISOString(),
+    device: str(dev, 8), // أول 8 حروف بس (للتمييز، مو التوكن كامل)
+    kind: str(body && body.kind, 20), page: str(body && body.page, 40), v: str(body && body.v, 30),
+    ref: str(body && body.ref, 40), msg: str(body && body.msg, 500), stack: str(body && body.stack, 1500),
+    src: str(body && body.src, 200), ua: str(body && body.ua, 160)
+  };
+  if (!rec.msg) return false;
+  fs.mkdirSync(path.dirname(CLIENT_ERRORS_PATH), { recursive: true });
+  try { if (fs.statSync(CLIENT_ERRORS_PATH).size > CLIENT_ERRORS_MAX_BYTES) fs.renameSync(CLIENT_ERRORS_PATH, CLIENT_ERRORS_PATH + '.1'); } catch (_) {}
+  fs.appendFileSync(CLIENT_ERRORS_PATH, JSON.stringify(rec) + '\n');
+  return true;
+}
+function readClientErrors(limit) {
+  let raw = '';
+  try { raw = fs.readFileSync(CLIENT_ERRORS_PATH, 'utf8'); } catch (_) {}
+  const out = [];
+  raw.split('\n').forEach(l => { if (l.trim()) { try { out.push(JSON.parse(l)); } catch (_) {} } });
+  return out.slice(-limit);
+}
+function groupClientErrors(list) {
+  const g = new Map();
+  list.forEach(r => {
+    const k = r.page + '|' + r.msg;
+    const e = g.get(k) || { page: r.page, msg: r.msg, stack: r.stack, count: 0, first: r.at, last: r.at, versions: new Set(), refs: new Set(), devices: new Set() };
+    e.count++; e.last = r.at; if (r.v) e.versions.add(r.v); if (r.ref) e.refs.add(r.ref); if (r.device) e.devices.add(r.device);
+    g.set(k, e);
+  });
+  return [...g.values()].sort((a, b) => (a.last < b.last ? 1 : -1));
+}
+function renderClientErrorsHtml(list) {
+  const rows = groupClientErrors(list).map(e =>
+    '<tr><td>' + escapeHtml(e.page) + '</td><td dir="ltr">' + escapeHtml(e.msg) + '<details><summary>stack</summary><pre dir="ltr">' + escapeHtml(e.stack) + '</pre></details></td><td>' + e.count +
+    '</td><td dir="ltr">' + escapeHtml(e.last.replace('T', ' ').slice(0, 19)) + '</td><td dir="ltr">' + escapeHtml([...e.versions].join(', ')) + '</td><td dir="ltr">' + escapeHtml([...e.refs].slice(0, 5).join(', ')) + '</td></tr>').join('');
+  return '<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>أخطاء الصفحات</title>' +
+    '<style>body{font-family:system-ui,Tahoma,sans-serif;background:#f4f5f7;color:#1c1c1c;margin:0;padding:16px}table{border-collapse:collapse;width:100%;background:#fff}th,td{border:1px solid #ddd;padding:6px 8px;text-align:right;vertical-align:top;font-size:13px}th{background:#eef1f4}pre{white-space:pre-wrap;font-size:11px}</style></head><body>' +
+    '<h2>أخطاء الصفحات (آخر ' + list.length + ' تسجيل)</h2>' + (rows ? '<table><thead><tr><th>الصفحة</th><th>الخطأ</th><th>العدد</th><th>آخر مرة</th><th>النسخة</th><th>العروض</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<p>ما في أخطاء مسجّلة.</p>') + '</body></html>';
+}
+app.post('/client-error', checkAuth, (req, res) => {
+  const dev = String(req.headers['x-device'] || req.query.device || req.query.token || 'legacy');
+  if (clientErrRateLimited(dev)) return res.status(429).json({ error: 'rate-limited' });
+  try { recordClientError(req.body, dev); res.json({ ok: true }); }
+  catch (e) { console.error('[ClientError] write failed:', e.message); res.status(500).json({ error: 'write-failed' }); }
+});
+app.get('/client-errors', (req, res) => {
+  if (!ADMIN_TOKEN || !safeTokenEquals(String(req.query.admin || ''), ADMIN_TOKEN)) return res.status(401).json({ error: 'unauthorized' });
+  const list = readClientErrors(500);
+  res.set('Cache-Control', 'no-store');
+  if (req.query.json === '1') return res.json(list);
+  res.send(renderClientErrorsHtml(list));
+});
 
 
 app.listen(PORT, () => console.log(`[Server] Running on port ${PORT}`));
