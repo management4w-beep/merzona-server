@@ -2165,12 +2165,44 @@ app.post('/users/delete', (req, res) => {
   res.json({ ok: true });
 });
 
+// ───────────────────────── قواعد أداة المشتريات (إعدادات قابلة للتعديل) ─────────────────────────
+// بتتخزن على الـVolume حتى تتشارك بين كل الأجهزة. GET/POST للأجهزة المعتمدة. POST بيطلب baseRev (رقم النسخة يلي انبنى عليها
+// التعديل) - لو حدا تاني عدّل بالأثناء بيرجع 409 مع النسخة الحالية بدل ما نكتب فوقها. بنحتفظ بنسخة .prev قبل كل استبدال.
+const PROC_RULES_PATH = process.env.PROC_RULES_PATH || path.join(path.dirname(ACCESS_DATA_PATH), 'procurement-rules.json');
+function loadProcRules() {
+  try {
+    const o = JSON.parse(fs.readFileSync(PROC_RULES_PATH, 'utf8'));
+    if (o && typeof o === 'object' && o.rules && typeof o.rules === 'object') return { rev: parseInt(o.rev, 10) || 0, updatedAt: o.updatedAt || null, rules: o.rules };
+  } catch (e) { if (e.code !== 'ENOENT') console.error('[ProcRules] read failed:', e.message); }
+  return { rev: 0, updatedAt: null, rules: null };
+}
+app.get('/procurement-rules', checkAuth, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(loadProcRules());
+});
+app.post('/procurement-rules', checkAuth, (req, res) => {
+  const body = req.body || {};
+  const rules = body.rules;
+  if (!rules || typeof rules !== 'object' || Array.isArray(rules)) return res.status(400).json({ error: 'expected {rules:{...}}' });
+  let size = 0; try { size = JSON.stringify(rules).length; } catch (_) {}
+  if (!size || size > 200000) return res.status(400).json({ error: 'rules-too-large' });
+  const cur = loadProcRules();
+  const base = parseInt(body.baseRev, 10) || 0;
+  if (cur.rules && base !== cur.rev) return res.status(409).json({ error: 'rev-mismatch', current: cur });
+  try {
+    if (cur.rules) { try { fs.copyFileSync(PROC_RULES_PATH, PROC_RULES_PATH + '.prev'); } catch (_) {} }
+    const next = { rev: cur.rev + 1, updatedAt: new Date().toISOString(), rules };
+    writeJsonStore(PROC_RULES_PATH, next);
+    res.json({ ok: true, rev: next.rev, updatedAt: next.updatedAt });
+  } catch (e) { console.error('[ProcRules] write failed:', e); res.status(500).json({ error: 'write-failed' }); }
+});
+
 // ───────────────────────── نسخ احتياطي تلقائي + تسجيل أخطاء ─────────────────────────
 // منسخ الملفات الصغيرة المهمة بس (مو جلسة الواتس اب لأنها كبيرة وبتتجدد من QR) على نفس الـVolume،
 // نسخة لكل يوم، ومنحتفظ بآخر 30 يوم. بيشتغل عند التشغيل وكل 6 ساعات.
 const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(ACCESS_DATA_PATH), 'backups');
 const BACKUP_KEEP_DAYS = parseInt(process.env.BACKUP_KEEP_DAYS || '30', 10);
-const BACKUP_FILES = [ACCESS_DATA_PATH, USERS_DATA_PATH, SESSIONS_DATA_PATH, DASHBOARD_SEED_PATH, GOOGLE_REFRESH_TOKEN_PATH];
+const BACKUP_FILES = [ACCESS_DATA_PATH, USERS_DATA_PATH, SESSIONS_DATA_PATH, DASHBOARD_SEED_PATH, GOOGLE_REFRESH_TOKEN_PATH, PROC_RULES_PATH];
 let lastBackupInfo = { at: null, files: 0, ok: null, error: null };
 function runBackup() {
   try {
