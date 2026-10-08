@@ -400,11 +400,11 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
   if (!GROUP_ID) return res.status(500).json({ error: 'GROUP_ID not set on the server - see README.md' });
   if (isRateLimited()) return res.status(429).json({ error: 'rate limit exceeded' });
 
-  const { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename, createdBy } = req.body || {};
+  const { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename, createdBy, currency } = req.body || {};
   if (!Array.isArray(items) || !items.length) {
     return res.status(400).json({ error: 'no items provided' });
   }
-  const payload = { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename, createdBy };
+  const payload = { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename, createdBy, currency };
 
   // 🆕 2026-10-07 (طلب حمدي: حل جذري للواتس اب): لو الواتس اب مفصول هلأ، ما منرفض الطلب (كانت الرسالة تضيع)؛
   // منخزّنها بطابور دائم على الـVolume وبتنبعت لحالها أول ما يرجع الاتصال. نفس الشي لو الإرسال نفسه فشل.
@@ -427,8 +427,18 @@ app.post('/send-quotation', checkAuth, async (req, res) => {
 });
 
 // بتبني رسالة عرض السعر وبتبعتها (مع PDF لو موجود). بترمي خطأ لو فشل الإرسال نهائيًا (حتى بعد الرجوع لنص بدون مرفق).
+// 🆕 2026-10-08 (بلاغ حمدي: رسالة الواتس اب ما بتاخد العملة بعين الاعتبار): كانت "AED" مكتوبة ثابتة. هلق العملة جاية من الأداة
+// (AED / USD / SYP)، ولو ما وصلت (نسخة قديمة أو رسالة قديمة بالطابور) منستنتجها من الرقم المرجعي: S-Q- = سوريا = دولار.
+function quoteCurrency(ref, currency) {
+  const c = String(currency || '').trim().toUpperCase();
+  if (['AED', 'USD', 'SYP'].includes(c)) return c;
+  return /^S-?Q-/i.test(String(ref || '').trim()) ? 'USD' : 'AED';
+}
+function isSyriaRef(ref) { return /^S-?Q-/i.test(String(ref || '').trim()); }
+
 async function deliverQuotation(p) {
   const { ref, client: clientName, location, mobile, items, grandTotal, pdfBase64, pdfFilename, createdBy } = p;
+  const cur = quoteCurrency(ref, p.currency);
   // NOTE: the outgoing WhatsApp message text below is in Arabic on purpose,
   // since that's the language of the "Tasks" group / the team reading it.
   // Only this file's comments and API responses were translated to English.
@@ -437,7 +447,7 @@ async function deliverQuotation(p) {
   // بصفحات/تطبيقات تعرض النص بالاتجاه الثنائي (bidi) - نفس النمط المستخدم بمكان تاني بالمشروع.
   if (ref) msg += `المرجع: ⁦${ref}⁩\n`;
   if (clientName) msg += `العميل: ${clientName}\n`;
-  if (location) msg += `الإمارة: ${location}\n`;
+  if (location) msg += `${isSyriaRef(ref) ? 'الموقع' : 'الإمارة'}: ${location}\n`;
   if (mobile) msg += `الموبايل: ${mobile}\n`;
   // 🆕 2026-08-26: اسم الشخص يلي أنشأ عرض السعر (من حساب المستخدم تبعو) - سطر اختياري، بيظهر
   // بس لو الأداة بعتت اسم فعلي (مثلاً المالك عن طريق رابط #owner= ما إلو حساب فما بيظهر السطر).
@@ -464,11 +474,11 @@ async function deliverQuotation(p) {
   for (const g of grouped.values()) {
     lineNo++;
     const qtyTxt = g.qty ? `×${g.qty}` : '';
-    const priceTxt = g.price ? `${g.price} AED/m²` : '';
+    const priceTxt = g.price ? `${g.price} ${cur}/m²` : '';
     const parts = [g.name, qtyTxt, priceTxt].filter(Boolean);
     msg += `${lineNo}. ${parts.join(' - ')}\n`;
   }
-  if (grandTotal) msg += `\n*الإجمالي: ${grandTotal} AED*`;
+  if (grandTotal) msg += `\n*الإجمالي: ${String(grandTotal).replace(/\s*(AED|USD|SYP)\s*$/i, '')} ${cur}*`;
 
   // Attach the quotation PDF itself when the tool sent one along - falls back to a
   // plain text message (still useful) if the PDF is missing or fails to attach for
@@ -1102,7 +1112,7 @@ async function renderCertificatePdf({ ref, clientName, total, signerName, signat
       <table>
         <tr><td class="label">الرقم المرجعي / Reference</td><td class="val">${escapeHtml(ref)}</td></tr>
         <tr><td class="label">اسم العميل / Client</td><td class="val">${escapeHtml(clientName || '-')}</td></tr>
-        <tr><td class="label">القيمة الإجمالية / Total</td><td class="val">${total ? fmtNumServer(total) + ' AED' : '-'}</td></tr>
+        <tr><td class="label">القيمة الإجمالية / Total</td><td class="val">${total ? fmtNumServer(total) + ' ' + quoteCurrency(ref) : '-'}</td></tr>
         <tr><td class="label">اسم الموقّع / Signed by</td><td class="val">${escapeHtml(signerName)}</td></tr>
         <tr><td class="label">تاريخ ووقت التوقيع / Signed at</td><td class="val">${escapeHtml(signedAtDisplay)}</td></tr>
       </table>
@@ -1201,7 +1211,7 @@ async function sendSignedContractToWhatsApp({ ref, clientName, total, signerName
   // 🆕 2026-08-27: نفس إصلاح bidi المطبّق بمسار /send-quotation
   msg += `المرجع: ⁦${ref}⁩\n`;
   if (clientName) msg += `العميل: ${clientName}\n`;
-  if (total) msg += `القيمة الإجمالية: ${fmtNumServer(total)} AED\n`;
+  if (total) msg += `القيمة الإجمالية: ${fmtNumServer(total)} ${quoteCurrency(ref)}\n`;
   msg += `الموقّع: ${signerName}\n`;
   const pdfBase64 = pdfBuffer.toString('base64');
   const media = new MessageMedia('application/pdf', pdfBase64, ref + '-signed.pdf');
