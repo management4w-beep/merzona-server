@@ -60,7 +60,7 @@ function loadGoogleRefreshToken() {
 function saveGoogleRefreshToken(token) {
   try {
     fs.mkdirSync(path.dirname(GOOGLE_REFRESH_TOKEN_PATH), { recursive: true });
-    fs.writeFileSync(GOOGLE_REFRESH_TOKEN_PATH, JSON.stringify({ refresh_token: token, savedAt: Date.now() }, null, 2));
+    { const _t = GOOGLE_REFRESH_TOKEN_PATH + '.tmp-' + process.pid; fs.writeFileSync(_t, JSON.stringify({ refresh_token: token, savedAt: Date.now() }, null, 2)); fs.renameSync(_t, GOOGLE_REFRESH_TOKEN_PATH); }
   } catch (e) {
     console.error('[Drive Auth] Failed to save refresh token:', e);
   }
@@ -434,6 +434,12 @@ function quoteCurrency(ref, currency) {
   if (['AED', 'USD', 'SYP'].includes(c)) return c;
   return /^S-?Q-/i.test(String(ref || '').trim()) ? 'USD' : 'AED';
 }
+// عملة عرض السعر من بيانات الدرايف: فرع سوريا بس بيقرأ #m-currency (usd/syp)؛ الإمارات دايمًا درهم (الحقل مخفي عندها).
+function currencyFromQuotationData(ref, data) {
+  if (!isSyriaRef(ref)) return 'AED';
+  const v = String((data && data.fields && data.fields['m-currency']) || '').trim().toUpperCase();
+  return v === 'SYP' ? 'SYP' : 'USD';
+}
 function isSyriaRef(ref) { return /^S-?Q-/i.test(String(ref || '').trim()); }
 
 async function deliverQuotation(p) {
@@ -712,7 +718,7 @@ async function getServerDriveAccessToken() {
 // الجهاز يصير بس لما ?device= مبعوت فعليًا، حتى ما نكسر هالمسارات التانية.
 app.get('/drive-token', checkAuth, async (req, res) => {
   try {
-    const deviceParam = (req.query.device || '').toString();
+    const deviceParam = (req.query.device || req.headers['x-device'] || '').toString();
     const devices = loadDevices();
     const entry = Object.prototype.hasOwnProperty.call(devices, deviceParam) ? devices[deviceParam] : null;
     if (!entry || entry.status !== 'approved') {
@@ -750,7 +756,7 @@ function loadDashboardSeed() {
   return [];
 }
 app.get('/dashboard-seed', checkAuth, (req, res) => {
-  const deviceParam = (req.query.device || '').toString();
+  const deviceParam = (req.query.device || req.headers['x-device'] || '').toString();
   const devices = loadDevices();
   const entry = Object.prototype.hasOwnProperty.call(devices, deviceParam) ? devices[deviceParam] : null;
   if (!entry || entry.status !== 'approved') return res.status(403).json({ error: 'device-not-approved' });
@@ -1088,7 +1094,7 @@ async function appendSignedContractToSyncData(token, { ref, clientName, fileEntr
 // بيولّد صفحة "شهادة توقيع إلكتروني" (HTML → PDF عبر Puppeteer/كروميوم) - منستخدم كروميوم بدل ما
 // نعتمد على خطوط pdf-lib القياسية (يلي أصلاً ما بتدعم العربي إطلاقًا) - هيك النص العربي بيطلع
 // بشكله الصحيح تمامًا (نفس محرك المتصفح يلي بيرسم كل صفحات ميرزونا العادية).
-async function renderCertificatePdf({ ref, clientName, total, signerName, signatureDataUrl, signedAtIso }) {
+async function renderCertificatePdf({ ref, clientName, total, currency, signerName, signatureDataUrl, signedAtIso }) {
   const signedAtDisplay = new Date(signedAtIso).toLocaleString('en-GB', { timeZone: 'Asia/Dubai', hour12: false }) + ' (Dubai time)';
   const html = `<!doctype html><html dir="rtl" lang="ar"><head><meta charset="utf-8"><style>
     body{font-family:'Segoe UI',Tahoma,Arial,sans-serif; margin:0; padding:36px; color:#1a1a2e; -webkit-print-color-adjust:exact;}
@@ -1112,7 +1118,7 @@ async function renderCertificatePdf({ ref, clientName, total, signerName, signat
       <table>
         <tr><td class="label">الرقم المرجعي / Reference</td><td class="val">${escapeHtml(ref)}</td></tr>
         <tr><td class="label">اسم العميل / Client</td><td class="val">${escapeHtml(clientName || '-')}</td></tr>
-        <tr><td class="label">القيمة الإجمالية / Total</td><td class="val">${total ? fmtNumServer(total) + ' ' + quoteCurrency(ref) : '-'}</td></tr>
+        <tr><td class="label">القيمة الإجمالية / Total</td><td class="val">${total ? fmtNumServer(total) + ' ' + quoteCurrency(ref, currency) : '-'}</td></tr>
         <tr><td class="label">اسم الموقّع / Signed by</td><td class="val">${escapeHtml(signerName)}</td></tr>
         <tr><td class="label">تاريخ ووقت التوقيع / Signed at</td><td class="val">${escapeHtml(signedAtDisplay)}</td></tr>
       </table>
@@ -1204,14 +1210,14 @@ async function overlaySignatureOnOriginalPdf(originalPdfBuffer, signBoxRect, sig
   return Buffer.from(bytes);
 }
 
-async function sendSignedContractToWhatsApp({ ref, clientName, total, signerName, pdfBuffer }) {
+async function sendSignedContractToWhatsApp({ ref, clientName, total, currency, signerName, pdfBuffer }) {
   if (!clientReady) throw new Error('whatsapp-not-ready');
   if (!CONTRACTS_GROUP_ID) throw new Error('CONTRACTS_GROUP_ID not set on the server - see README.md');
   let msg = '✅ *عقد جديد موقّع إلكترونيًا - Merzona*\n';
   // 🆕 2026-08-27: نفس إصلاح bidi المطبّق بمسار /send-quotation
   msg += `المرجع: ⁦${ref}⁩\n`;
   if (clientName) msg += `العميل: ${clientName}\n`;
-  if (total) msg += `القيمة الإجمالية: ${fmtNumServer(total)} ${quoteCurrency(ref)}\n`;
+  if (total) msg += `القيمة الإجمالية: ${fmtNumServer(total)} ${quoteCurrency(ref, currency)}\n`;
   msg += `الموقّع: ${signerName}\n`;
   const pdfBase64 = pdfBuffer.toString('base64');
   const media = new MessageMedia('application/pdf', pdfBase64, ref + '-signed.pdf');
@@ -1298,7 +1304,7 @@ app.post('/sign/:ref', async (req, res) => {
   if (!agree) return res.status(400).json({ error: 'must-agree' });
   const cleanSignerName = String(signerName || '').trim().slice(0, 120);
   if (!cleanSignerName) return res.status(400).json({ error: 'missing-signer-name' });
-  if (!/^data:image\/(png|jpeg);base64,/.test(String(signatureDataUrl || ''))) {
+  if (!/^data:image\/(png|jpeg);base64,[A-Za-z0-9+\/=]+$/.test(String(signatureDataUrl || '')) || String(signatureDataUrl).length > 2000000) {
     return res.status(400).json({ error: 'missing-signature' });
   }
   if (isSignSubmitRateLimited()) return res.status(429).json({ error: 'rate-limit' });
@@ -1334,6 +1340,7 @@ app.post('/sign/:ref', async (req, res) => {
     const signedAtIso = new Date().toISOString();
     const clientName = (data.fields && data.fields['m-client']) || '';
     const total = data.grandTotal || 0;
+    const currency = currencyFromQuotationData(ref, data);
 
     // 🆕 2026-08-27: أولوية لرسم توقيع الزبون الحقيقي مباشرة فوق صندوق "Client Signature" الأصلي
     // بنفس مكانه بالضبط (طلب حمدي) - وبس لو ما نجحت (مثلاً عرض سعر قديم من قبل هالميزة، ما عنده
@@ -1347,7 +1354,7 @@ app.post('/sign/:ref', async (req, res) => {
       mergedPdfBuffer = null;
     }
     if (!mergedPdfBuffer) {
-      const certPdfBuffer = await renderCertificatePdf({ ref, clientName, total, signerName: cleanSignerName, signatureDataUrl, signedAtIso });
+      const certPdfBuffer = await renderCertificatePdf({ ref, clientName, total, currency, signerName: cleanSignerName, signatureDataUrl, signedAtIso });
       mergedPdfBuffer = await mergeCertificateIntoPdf(originalPdfBuffer, certPdfBuffer);
     }
 
@@ -1392,7 +1399,7 @@ app.post('/sign/:ref', async (req, res) => {
 
     let whatsappWarning = null;
     try {
-      await sendSignedContractToWhatsApp({ ref, clientName, total, signerName: cleanSignerName, pdfBuffer: mergedPdfBuffer });
+      await sendSignedContractToWhatsApp({ ref, clientName, total, currency, signerName: cleanSignerName, pdfBuffer: mergedPdfBuffer });
     } catch (waErr) {
       console.error('[Sign] Failed to send WhatsApp notification for signed contract:', waErr);
       whatsappWarning = String((waErr && waErr.message) || waErr);
@@ -2133,6 +2140,7 @@ app.post('/users/reset-password', (req, res) => {
   const users = loadUsers();
   const u = users[key];
   if (!u) return res.status(404).json({ error: 'user not found' });
+  if (!admin.isFullAdmin && (u.isAdmin || (u.permissions && u.permissions.manageUsers))) return res.status(403).json({ error: 'forbidden' });
   delete u.passwordHash;
   users[key] = u;
   saveUsers(users);
@@ -2151,6 +2159,9 @@ app.post('/users/delete', (req, res) => {
   const key = normalizeUsername(username);
   const users = loadUsers();
   if (!users[key]) return res.status(404).json({ error: 'user not found' });
+  { const u = users[key];
+  if (!admin.isFullAdmin && (u.isAdmin || (u.permissions && u.permissions.manageUsers))) return res.status(403).json({ error: 'forbidden' });
+  }
   const deletedDeviceToken = users[key].deviceToken;
   delete users[key];
   saveUsers(users);
@@ -2322,5 +2333,12 @@ app.get('/client-errors', (req, res) => {
   res.send(renderClientErrorsHtml(list));
 });
 
+
+// معالج أخطاء JSON/الجسم: يرجّع JSON بدل صفحة HTML فيها مسارات الملفات
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = (err && (err.status || err.statusCode)) || 500;
+  res.status(status >= 400 && status < 600 ? status : 500).json({ error: status === 413 ? 'payload-too-large' : (status === 400 ? 'bad-request' : 'server-error') });
+});
 
 app.listen(PORT, () => console.log(`[Server] Running on port ${PORT}`));
